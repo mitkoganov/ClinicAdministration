@@ -1,0 +1,70 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "AI: Run Current Task",
+      "type": "shell",
+      "command": "pwsh",
+      "args": ["-NoProfile", "-File", "${workspaceFolder}/.ai-workflow/scripts/run-task.ps1"],
+      "group": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "AI: Run Quality Gates",
+      "type": "shell",
+      "command": "pwsh",
+      "args": ["-NoProfile", "-File", "${workspaceFolder}/.ai-workflow/scripts/run-tests.ps1"],
+      "group": { "kind": "test", "isDefault": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "AI: Review Current Changes",
+      "type": "shell",
+      "command": "pwsh",
+      "args": ["-NoProfile", "-File", "${workspaceFolder}/.ai-workflow/scripts/run-review.ps1"],
+      "group": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "AI: Repair Review Findings",
+      "type": "shell",
+      "command": "pwsh",
+      "args": ["-NoProfile", "-File", "${workspaceFolder}/.ai-workflow/scripts/run-repair.ps1"],
+      "group": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "Dev: Start Platform",
+      "type": "shell",
+      "command": "docker",
+      "args": ["compose", "up", "-d"],
+      "group": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "Dev: Stop Platform",
+      "type": "shell",
+      "command": "docker",
+      "args": ["compose", "down"],
+      "group": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "Dev: Backend Tests",
+      "type": "shell",
+      "command": "${workspaceFolder}/backend/.venv/Scripts/python.exe",
+      "args": ["-m", "pytest"],
+      "options": { "cwd": "${workspaceFolder}/backend" },
+      "group": { "kind": "test", "isDefault": false },
+      "problemMatcher": []
+    },
+    {
+      "label": "Dev: Frontend Checks",
+      "type": "shell",
+      "command": "npm run lint && npm run typecheck && npm run build",
+      "options": { "cwd": "${workspaceFolder}/frontend" },
+      "group": "test",
+      "problemMatcher": []
+    }
+  ]
+}

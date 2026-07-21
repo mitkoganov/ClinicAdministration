@@ -1,0 +1,36 @@
+# Python
+backend/.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+backend/clinic_admin_backend.egg-info/
+
+# Node / Next.js
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/coverage/
+frontend/tsconfig.tsbuildinfo
+
+# Environment
+.env
+*.env.local
+
+# Docker
+docker-compose.override.yml
+
+# Editors
+.vscode/*.log
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Setup state (contains local resume info, not secrets, but machine-specific)
+.setup/*.local.json
+
+# Logs
+*.log

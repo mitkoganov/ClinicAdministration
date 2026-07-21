@@ -1,0 +1,56 @@
+{
+  "completedPhases": [
+    "phase1-system-inspection",
+    "phase2-project-and-git-init",
+    "phase3-monorepo-foundation",
+    "phase4-ai-workflow",
+    "docker-desktop-installed-and-validated",
+    "phase5-full-validation-with-docker",
+    "git-identity-set-repository-local",
+    "codex-cli-authenticated"
+  ],
+  "pendingPhases": [],
+  "installedTools": {
+    "powershell7": { "version": "7.6.3", "status": "installed-and-validated" },
+    "dockerDesktop": { "version": "29.6.2", "compose": "v5.3.1", "status": "installed-and-validated" },
+    "codexCli": { "version": "0.144.6", "status": "installed-and-authenticated (chatgpt auth, pre-existing ~/.codex/auth.json)" },
+    "vscodeExtensions": [
+      "ms-vscode-remote.remote-wsl",
+      "dbaeumer.vscode-eslint",
+      "editorconfig.editorconfig"
+    ]
+  },
+  "validationResults": {
+    "backendRuff": "pass",
+    "backendMypy": "pass",
+    "backendPytest": "pass (9/9)",
+    "frontendLint": "pass",
+    "frontendTypecheck": "pass",
+    "frontendBuild": "pass",
+    "dockerComposeConfig": "pass (docker compose config, real validation)",
+    "dockerHelloWorld": "pass",
+    "dockerImageBuild": "pass (backend + frontend images built)",
+    "dockerComposeUp": "pass (all 5 services started: postgres, redis, qdrant, backend, frontend)",
+    "backendHealthEndpoint": "pass (200 ok)",
+    "backendReadyEndpoint": "pass after fix (200, status ok, database/redis/qdrant all ok)",
+    "frontendAvailability": "pass (200)",
+    "dockerComposeDown": "pass (stack torn down cleanly)",
+    "jsonSyntaxAllFiles": "pass",
+    "powershellSyntaxAllScripts": "pass (found and fixed two real bugs: em-dash bytes misparsed as string terminators, and Start-Process unable to launch npm's .cmd/.ps1 shim directly)",
+    "aiWorkflowRunTestsScript": "pass (exit 0)",
+    "aiWorkflowRunReviewScript": "pass (exit 0, no-op: no uncommitted changes to review yet)",
+    "aiWorkflowRunTaskScript": "pass (exit 2, graceful no-op: claude CLI not on PATH)",
+    "aiWorkflowRunRepairScript": "pass (exit 1, graceful: no review report yet)",
+    "gitStatus": "repo initialized, identity set, no commits, no .env, all files untracked"
+  },
+  "restartRequired": false,
+  "authenticationRequired": {
+    "dockerDesktop": "not required - engine running under current user session",
+    "codexCli": "already authenticated (chatgpt auth mode)"
+  },
+  "manualStepsPending": [
+    "Optional: run 'npm audit fix --force' in frontend/ only after reviewing the breaking change (downgrades Next.js) - not applied automatically",
+    "Review AGENTS.md/CLAUDE.md and start work from tasks/current/task.md (MED-001) before adding any business functionality"
+  ],
+  "nextSafeCommand": "pwsh -NoProfile -File .ai-workflow/scripts/run-tests.ps1"
+}

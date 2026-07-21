@@ -1,0 +1,16 @@
+{
+  "protectedBranches": ["main", "master"],
+  "maxRepairAttempts": 2,
+  "implementationAgent": {
+    "tool": "claude",
+    "note": "Claude Code CLI was not found on PATH in this environment at setup time (only the VS Code extension is installed). run-task.ps1 detects this and reports it rather than fabricating a run."
+  },
+  "reviewAgent": {
+    "tool": "codex",
+    "mode": "exec",
+    "sandbox": "read-only",
+    "note": "Codex CLI 0.144.6 validated at setup time via `codex --version`. Review runs with --sandbox read-only so it cannot write to the repository."
+  },
+  "reportsDir": "reports",
+  "requireFeatureBranchForImplementation": true
+}
