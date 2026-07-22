@@ -25,9 +25,13 @@ class MembershipStatus(StrEnum):
 
 class TenantMembership(Base):
     """Connects a user identity to a tenant with a role. `user_id` has no
-    foreign key target: no `User` table exists yet (authentication is a
-    separate, future module — see ARCHITECTURE.md). It is a documented
-    placeholder identifier compatible with the future authentication layer."""
+    foreign key target, deliberately: this predates `UserAccount` (MED-004)
+    and is left unconstrained rather than adding a cross-migration FK to the
+    already-released MED-002 migration (see CLAUDE.md — never edit a
+    released migration). `user_id` values are meant to line up with
+    `UserAccount.id` once an account exists, but the database does not
+    enforce that itself; see ARCHITECTURE.md — "Authentication and user
+    identity"."""
 
     __tablename__ = "tenant_memberships"
     __table_args__ = (
