@@ -7,7 +7,7 @@ from sqlalchemy import Enum as SAEnum
 from sqlalchemy.orm import Mapped, mapped_column, validates
 from sqlalchemy.types import Uuid
 
-from app.core.slug import validate_slug
+from app.core.slug import normalize_and_validate_slug
 from app.db.base import Base
 
 # Mirrors app.core.slug.validate_slug's rules at the database level: a
@@ -31,7 +31,10 @@ class Tenant(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
-    # Always the normalized form produced by app.core.slug.normalize_slug.
+    # Always the normalized form - see the `@validates("slug")` hook below,
+    # which normalizes raw input via app.core.slug.normalize_and_validate_slug
+    # on every assignment/construction, so callers never need to normalize
+    # first themselves.
     slug: Mapped[str] = mapped_column(String(200), nullable=False, unique=True, index=True)
     status: Mapped[TenantStatus] = mapped_column(
         SAEnum(
@@ -60,9 +63,13 @@ class Tenant(Base):
 
     @validates("slug")
     def _validate_slug(self, key: str, value: str) -> str:
-        # Application-layer enforcement (layer 1); the CHECK constraint
-        # above is layer 2. Raises app.core.slug.InvalidSlugError - a
-        # ValueError subclass - immediately on assignment/construction,
-        # before any flush or commit.
-        validate_slug(value)
-        return value
+        # The single canonical write path for this column: normalizes raw
+        # input (lowercase, non-alphanumeric runs collapsed to one hyphen,
+        # leading/trailing hyphens stripped) and validates the result,
+        # before any flush or commit - app.core.slug.normalize_and_validate_slug
+        # is the one place these rules are defined; do not re-implement them
+        # here or in any service/schema. Application-layer enforcement
+        # (layer 1); the CHECK constraint above is layer 2. Raises
+        # app.core.slug.InvalidSlugError - a ValueError subclass - if the
+        # normalized result is still invalid (e.g. punctuation-only input).
+        return normalize_and_validate_slug(value)

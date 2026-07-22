@@ -7,7 +7,7 @@ from sqlalchemy.exc import IntegrityError
 from app.core.errors import NotFoundError
 from app.models.membership import MembershipRole, MembershipStatus, TenantMembership
 from app.models.tenant import Tenant, TenantStatus
-from app.services.tenant_service import normalize_slug, resolve_membership, resolve_tenant
+from app.services.tenant_service import resolve_membership, resolve_tenant
 
 # Every test in this module uses db_session/tenancy - a real disposable
 # Postgres test database.
@@ -50,20 +50,33 @@ def test_role_is_exposed_correctly(db_session, tenancy):
 
 
 def test_normalized_slug_uniqueness_is_enforced_at_the_database_level(db_session):
-    db_session.add(
-        Tenant(name="Acme", slug=normalize_slug("Acme Clinic"), status=TenantStatus.ACTIVE)
-    )
+    # Raw, differently-formatted inputs - not pre-normalized by the test -
+    # so this proves the model's own normalization is what makes them
+    # collide, not just that two pre-normalized strings collide.
+    db_session.add(Tenant(name="Acme", slug="Acme Clinic", status=TenantStatus.ACTIVE))
     db_session.flush()
 
     db_session.add(
         Tenant(
             name="Acme Duplicate",
-            slug=normalize_slug("  ACME   CLINIC "),
+            slug="  ACME   CLINIC ",
             status=TenantStatus.ACTIVE,
         )
     )
     with pytest.raises(IntegrityError):
         db_session.flush()
+
+
+def test_tenant_slug_raw_input_is_persisted_as_the_normalized_value(db_session):
+    tenant = Tenant(name="Acme", slug="  Acme___Clinic!! ", status=TenantStatus.ACTIVE)
+    db_session.add(tenant)
+    db_session.flush()
+
+    raw_slug = db_session.execute(
+        text("SELECT slug FROM tenants WHERE id = :id"), {"id": str(tenant.id)}
+    ).scalar_one()
+
+    assert raw_slug == "acme-clinic"
 
 
 def test_tenant_status_is_persisted_as_the_documented_lowercase_value(db_session):

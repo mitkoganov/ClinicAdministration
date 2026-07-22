@@ -75,6 +75,57 @@ def test_tenant_model_rejects_invalid_slug_on_assignment():
         tenant.slug = "!!"
 
 
+def test_tenant_model_normalizes_raw_slug_input_on_construction():
+    # The model is the single canonical write path: raw, unnormalized input
+    # must be normalized (not rejected) at construction time.
+    tenant = Tenant(name="Acme", slug="Acme Clinic", status=TenantStatus.ACTIVE)
+    assert tenant.slug == "acme-clinic"
+
+
+def test_tenant_model_normalizes_whitespace_and_repeated_separators():
+    tenant = Tenant(name="Acme", slug="  Acme   Clinic ", status=TenantStatus.ACTIVE)
+    assert tenant.slug == "acme-clinic"
+
+
+def test_tenant_model_normalizes_repeated_hyphens():
+    tenant = Tenant(name="Acme", slug="Acme---Clinic", status=TenantStatus.ACTIVE)
+    assert tenant.slug == "acme-clinic"
+
+
+def test_tenant_model_normalizes_underscores_as_separators():
+    tenant = Tenant(name="Acme", slug="Acme_Clinic", status=TenantStatus.ACTIVE)
+    assert tenant.slug == "acme-clinic"
+
+
+def test_tenant_model_lowercases_input():
+    tenant = Tenant(name="Acme", slug="ACME_CLINIC", status=TenantStatus.ACTIVE)
+    assert tenant.slug == "acme-clinic"
+
+
+def test_tenant_model_rejects_punctuation_only_input():
+    with pytest.raises(InvalidSlugError):
+        Tenant(name="Bad", slug="!!!", status=TenantStatus.ACTIVE)
+
+
+def test_tenant_model_rejects_whitespace_only_input():
+    with pytest.raises(InvalidSlugError):
+        Tenant(name="Bad", slug="   ", status=TenantStatus.ACTIVE)
+
+
+def test_tenant_model_leaves_an_already_normalized_slug_unchanged():
+    tenant = Tenant(name="Acme", slug="acme-clinic", status=TenantStatus.ACTIVE)
+    assert tenant.slug == "acme-clinic"
+
+
+def test_direct_model_construction_matches_the_canonical_normalization_function():
+    raw = "  Acme___Clinic!! "
+    expected = normalize_and_validate_slug(raw)
+
+    tenant = Tenant(name="Acme", slug=raw, status=TenantStatus.ACTIVE)
+
+    assert tenant.slug == expected == "acme-clinic"
+
+
 @pytest.mark.integration
 def test_database_check_constraint_rejects_empty_slug_bypassing_the_orm(db_session):
     # Bypasses Tenant's @validates hook entirely via a raw SQL insert,
