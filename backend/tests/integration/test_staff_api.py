@@ -129,6 +129,40 @@ def test_manager_cannot_remove_content_editor(client, tenancy):
     assert response.status_code == 403
 
 
+def test_manager_can_deactivate_content_editor(client, tenancy):
+    # Status change (activate/deactivate) is allowed by a manager on any
+    # non-owner target - unlike role change or removal, which stay
+    # restricted to operator/auditor targets (see the two tests above).
+    content_editor_id = _membership_id(client, tenancy, tenancy.content_editor_a)
+
+    response = client.patch(
+        f"{STAFF_URL}/{content_editor_id}",
+        json={"status": "inactive"},
+        headers=dev_headers(tenancy.manager_a, tenancy.tenant_a.id),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "inactive"
+
+
+def test_manager_can_deactivate_another_manager(client, tenancy):
+    create_response = client.post(
+        STAFF_URL,
+        json={"user_id": str(uuid.uuid4()), "role": "manager"},
+        headers=dev_headers(tenancy.owner_a, tenancy.tenant_a.id),
+    )
+    other_manager_id = create_response.json()["id"]
+
+    response = client.patch(
+        f"{STAFF_URL}/{other_manager_id}",
+        json={"status": "inactive"},
+        headers=dev_headers(tenancy.manager_a, tenancy.tenant_a.id),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "inactive"
+
+
 def test_manager_cannot_change_role_of_content_editor(client, tenancy):
     content_editor_id = _membership_id(client, tenancy, tenancy.content_editor_a)
 

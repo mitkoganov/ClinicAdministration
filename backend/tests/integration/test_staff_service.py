@@ -257,10 +257,10 @@ def test_manager_cannot_change_role_of_content_editor(db_session, tenancy):
         service.update(context, target_id, role=MembershipRole.AUDITOR)
 
 
-def test_manager_cannot_administer_own_manager_membership(db_session, tenancy):
-    # A manager's own membership role is MANAGER - not in the manager-
-    # administrable target set - so self-targeting must not be a way to
-    # bypass that restriction.
+def test_manager_cannot_change_own_role(db_session, tenancy):
+    # A manager's own CURRENT role is MANAGER - not in the operator/auditor
+    # role-change target set - so self-targeting must not be a way to
+    # bypass that restriction (role change is narrower than status change).
     service = StaffService(db_session)
     manager_membership_id = _membership_id(db_session, tenancy, tenancy.manager_a)
     context = _context(
@@ -268,7 +268,23 @@ def test_manager_cannot_administer_own_manager_membership(db_session, tenancy):
     )
 
     with pytest.raises(ForbiddenError):
-        service.update(context, manager_membership_id, status=MembershipStatus.INACTIVE)
+        service.update(context, manager_membership_id, role=MembershipRole.OPERATOR)
+
+
+def test_manager_can_deactivate_own_membership(db_session, tenancy):
+    # Status change (activate/deactivate) is allowed by a manager on any
+    # non-owner target, per task.md - including their own membership,
+    # unlike role change or removal which stay restricted to
+    # operator/auditor targets.
+    service = StaffService(db_session)
+    manager_membership_id = _membership_id(db_session, tenancy, tenancy.manager_a)
+    context = _context(
+        tenancy, tenancy.manager_a, MembershipRole.MANAGER, membership_id=manager_membership_id
+    )
+
+    updated = service.update(context, manager_membership_id, status=MembershipStatus.INACTIVE)
+
+    assert updated.status == MembershipStatus.INACTIVE
 
 
 def test_self_elevation_is_rejected(db_session, tenancy):
@@ -356,6 +372,34 @@ def test_manager_cannot_deactivate_owner(db_session, tenancy):
 
     with pytest.raises(ForbiddenError):
         service.update(context, owner_membership_id, status=MembershipStatus.INACTIVE)
+
+
+def test_manager_can_deactivate_content_editor(db_session, tenancy):
+    # Status change is allowed by a manager on any non-owner target,
+    # unlike role change or removal, which stay restricted to
+    # operator/auditor targets.
+    service = StaffService(db_session)
+    context = _context(tenancy, tenancy.manager_a, MembershipRole.MANAGER)
+    content_editor_id = _membership_id(db_session, tenancy, tenancy.content_editor_a)
+
+    deactivated = service.update(context, content_editor_id, status=MembershipStatus.INACTIVE)
+    assert deactivated.status == MembershipStatus.INACTIVE
+
+    reactivated = service.update(context, content_editor_id, status=MembershipStatus.ACTIVE)
+    assert reactivated.status == MembershipStatus.ACTIVE
+
+
+def test_manager_can_deactivate_another_manager(db_session, tenancy):
+    service = StaffService(db_session)
+    owner_context = _context(tenancy, tenancy.owner_a, MembershipRole.OWNER)
+    other_manager_id = service.create(owner_context, uuid.uuid4(), MembershipRole.MANAGER).id
+
+    manager_context = _context(tenancy, tenancy.manager_a, MembershipRole.MANAGER)
+    deactivated = service.update(
+        manager_context, other_manager_id, status=MembershipStatus.INACTIVE
+    )
+
+    assert deactivated.status == MembershipStatus.INACTIVE
 
 
 # --- final-owner invariant ----------------------------------------------------

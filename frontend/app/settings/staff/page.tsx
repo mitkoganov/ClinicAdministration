@@ -33,22 +33,35 @@ const ROLES: MembershipRole[] = ["owner", "manager", "operator", "content_editor
 const PAGE_SIZE = 20;
 // Hides mutation controls entirely for a viewer/target combination that
 // can never succeed - a usability convenience only, mirroring
-// app.services.staff_service's _can_manager_administer_target /
-// _MANAGER_ADMINISTRABLE_ROLES exactly. The backend independently
+// app.services.staff_service exactly. The backend independently
 // re-derives and enforces every one of these rules regardless of what the
 // UI offers or hides.
+//
+// A manager's permitted target set is action-dependent, per task.md:
+// invite/role-change/remove are restricted to operator/auditor targets
+// (`canManagerChangeRoleOrRemove`), while activate/deactivate is allowed
+// for any non-owner target (`canManagerChangeStatus`) - these are
+// deliberately two different, non-overlapping rules, not one.
 const MANAGE_ROLES = new Set<MembershipRole>(["owner", "manager"]);
-const MANAGER_ADMINISTRABLE_ROLES = new Set<MembershipRole>(["operator", "auditor"]);
+const MANAGER_ROLE_CHANGE_OR_REMOVE_ROLES = new Set<MembershipRole>(["operator", "auditor"]);
 
-function canAdministerTarget(viewerRole: MembershipRole, targetRole: MembershipRole): boolean {
+function canChangeRoleOrRemove(viewerRole: MembershipRole, targetRole: MembershipRole): boolean {
   if (viewerRole === "owner") return true;
-  if (viewerRole === "manager") return MANAGER_ADMINISTRABLE_ROLES.has(targetRole);
+  if (viewerRole === "manager") return MANAGER_ROLE_CHANGE_OR_REMOVE_ROLES.has(targetRole);
+  return false;
+}
+
+function canChangeStatus(viewerRole: MembershipRole, targetRole: MembershipRole): boolean {
+  if (viewerRole === "owner") return true;
+  if (viewerRole === "manager") return targetRole !== "owner";
   return false;
 }
 
 function assignableRolesFor(viewerRole: MembershipRole): MembershipRole[] {
   if (viewerRole === "owner") return ROLES;
-  if (viewerRole === "manager") return ROLES.filter((r) => MANAGER_ADMINISTRABLE_ROLES.has(r));
+  if (viewerRole === "manager") {
+    return ROLES.filter((r) => MANAGER_ROLE_CHANGE_OR_REMOVE_ROLES.has(r));
+  }
   return [];
 }
 
@@ -240,12 +253,14 @@ export default function StaffPage() {
         </thead>
         <tbody>
           {list.items.map((member) => {
-            const rowCanManage = canManage && canAdministerTarget(viewerRole, member.role);
+            const rowCanChangeRoleOrRemove =
+              canManage && canChangeRoleOrRemove(viewerRole, member.role);
+            const rowCanChangeStatus = canManage && canChangeStatus(viewerRole, member.role);
             return (
               <tr key={member.id}>
                 <td>{member.user_id}</td>
                 <td>
-                  {rowCanManage ? (
+                  {rowCanChangeRoleOrRemove ? (
                     <select
                       value={member.role}
                       disabled={pendingRowId === member.id}
@@ -270,26 +285,25 @@ export default function StaffPage() {
                 <td>{member.status}</td>
                 <td>{new Date(member.created_at).toLocaleDateString()}</td>
                 <td style={{ display: "flex", gap: "0.5rem" }}>
-                  {rowCanManage ? (
-                    <>
-                      <button
-                        type="button"
-                        disabled={pendingRowId === member.id}
-                        onClick={() => handleToggleStatus(member)}
-                      >
-                        {member.status === "active" ? "Deactivate" : "Activate"}
-                      </button>
-                      <button
-                        type="button"
-                        disabled={pendingRowId === member.id}
-                        onClick={() => handleRemove(member)}
-                      >
-                        Remove
-                      </button>
-                    </>
-                  ) : (
-                    <span>—</span>
+                  {rowCanChangeStatus && (
+                    <button
+                      type="button"
+                      disabled={pendingRowId === member.id}
+                      onClick={() => handleToggleStatus(member)}
+                    >
+                      {member.status === "active" ? "Deactivate" : "Activate"}
+                    </button>
                   )}
+                  {rowCanChangeRoleOrRemove && (
+                    <button
+                      type="button"
+                      disabled={pendingRowId === member.id}
+                      onClick={() => handleRemove(member)}
+                    >
+                      Remove
+                    </button>
+                  )}
+                  {!rowCanChangeStatus && !rowCanChangeRoleOrRemove && <span>—</span>}
                 </td>
               </tr>
             );

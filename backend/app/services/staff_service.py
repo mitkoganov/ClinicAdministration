@@ -9,11 +9,17 @@ BEFORE emitting a `SUCCESS` audit event - never after.
 
 Authorization matrix (see tasks/current/task.md "Roles" section):
   * OWNER may invite/change/deactivate/remove any role.
-  * MANAGER may invite, deactivate/activate, change the role of, or remove
-    ONLY memberships whose CURRENT role is OPERATOR or AUDITOR
-    (`_can_manager_administer_target`) - never OWNER, MANAGER, or
-    CONTENT_EDITOR, including their own membership if it is one of those
-    roles. A manager may also never grant OWNER to anyone.
+  * MANAGER's permitted target set is action-dependent - task.md
+    deliberately draws this distinction, it is not a single uniform rule:
+    - invite (create), role change, and remove (delete) are restricted to
+      memberships whose CURRENT role is OPERATOR or AUDITOR
+      (`_can_manager_administer_target`);
+    - activate/deactivate (a `status`-only update) is allowed for ANY
+      non-OWNER target, including MANAGER and CONTENT_EDITOR
+      (`_can_manager_change_status`) - task.md: "activate/deactivate
+      non-owner memberships."
+    A manager may also never grant OWNER to anyone, and never mutate an
+    OWNER membership through any of the above.
   * OPERATOR/CONTENT_EDITOR/AUDITOR may never mutate staff.
   * No one may elevate their own role (see `_ROLE_RANK` below).
   * The clinic's last active OWNER can never be demoted, deactivated, or
@@ -47,13 +53,11 @@ _ROLE_RANK: dict[MembershipRole, int] = {
     MembershipRole.AUDITOR: 1,
 }
 
-# The only CURRENT target roles a MANAGER may administer at all - for
-# every mutation (create/invite, role change, activate, deactivate,
-# remove), not just delete. A manager targeting an OWNER, MANAGER, or
-# CONTENT_EDITOR membership (including their own, if it is one of those
-# roles) is rejected before any other check runs. Task.md: "Manager may
-# invite operator and auditor roles" generalizes to "may administer only
-# operator/auditor memberships."
+# The only CURRENT target roles a MANAGER may invite, change the role of,
+# or remove - task.md: "Manager may invite operator and auditor roles"
+# and "remove operator and auditor memberships." Deliberately NOT used for
+# activate/deactivate - see `_can_manager_change_status` below, which is
+# broader per the same task.md section.
 _MANAGER_ADMINISTRABLE_ROLES: frozenset[MembershipRole] = frozenset(
     {MembershipRole.OPERATOR, MembershipRole.AUDITOR}
 )
@@ -61,6 +65,13 @@ _MANAGER_ADMINISTRABLE_ROLES: frozenset[MembershipRole] = frozenset(
 
 def _can_manager_administer_target(target_role: MembershipRole) -> bool:
     return target_role in _MANAGER_ADMINISTRABLE_ROLES
+
+
+def _can_manager_change_status(target_role: MembershipRole) -> bool:
+    # task.md: "activate/deactivate non-owner memberships" - any role
+    # except OWNER, which is strictly broader than
+    # `_can_manager_administer_target` (used for invite/role-change/remove).
+    return target_role != MembershipRole.OWNER
 
 
 class StaffService:
@@ -201,13 +212,14 @@ class StaffService:
     ) -> None:
         if role is None and status is None:
             return
-        if context.role == MembershipRole.MANAGER and not _can_manager_administer_target(
-            target.role
-        ):
-            raise ForbiddenError("Not permitted to perform this action.")
-        if role is not None:
-            if context.role == MembershipRole.MANAGER and role == MembershipRole.OWNER:
+        if context.role == MembershipRole.MANAGER:
+            if role is not None and (
+                role == MembershipRole.OWNER or not _can_manager_administer_target(target.role)
+            ):
                 raise ForbiddenError("Not permitted to perform this action.")
+            if status is not None and not _can_manager_change_status(target.role):
+                raise ForbiddenError("Not permitted to perform this action.")
+        if role is not None:
             if target.user_id == context.user_id and _ROLE_RANK[role] > _ROLE_RANK[target.role]:
                 raise ForbiddenError("Not permitted to perform this action.")
 
