@@ -61,10 +61,16 @@ given (no prose before or after it, no markdown code fence). Shape:
 }
 ```
 
-* `reviewed_files` — every file path you actually reviewed from the packet.
-  This must be non-empty for any status other than `REVIEW_INCOMPLETE`.
-* `omitted_files` — file paths mentioned in the packet's own "omitted" list
-  that you were not able to review as a result (copy them through).
+* `reviewed_files` — every file path you actually reviewed from the packet,
+  including every path listed under "## Embedded evidence files" if that
+  section is present (those are embedded in full elsewhere in the packet
+  specifically so you review them). This must be non-empty for any status
+  other than `REVIEW_INCOMPLETE`.
+* `omitted_files` — file paths mentioned in the packet's own "## Omitted
+  files" list that you were not able to review as a result (copy them
+  through). A path listed under "## Embedded evidence files" is never also
+  an omission — if a path appears in both sections, treat it as reviewed,
+  not omitted; that would be a packet-construction bug, not a real gap.
 * `findings` — empty array if there are none. Do not invent a finding to
   avoid returning an empty list.
 * A non-empty `findings` array with only `low` severity items does not by

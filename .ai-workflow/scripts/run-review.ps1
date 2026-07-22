@@ -19,8 +19,17 @@
 # -DryRun builds and saves the prompt + packet files (for inspection) and
 # stops before invoking Codex at all - use this to check what would be sent
 # without spending a Codex call.
+#
+# -ValidateProvenance builds the packet (like -DryRun) and then asserts the
+# embedded-evidence/omitted-files provenance rules hold - no report file is
+# ever both embedded as evidence and listed as omitted, generic reports/
+# noise and this tooling's own self-referential output stay excluded, and
+# the two allowlisted evidence files are embedded whenever present. Exits
+# non-zero without invoking Codex if any assertion fails. This is the
+# narrow, fixture-free validation mode for this provenance logic - there is
+# no larger test harness for this PowerShell tooling to plug into.
 
-param([switch]$DryRun)
+param([switch]$DryRun, [switch]$ValidateProvenance)
 
 . "$PSScriptRoot\common.ps1"
 
@@ -97,13 +106,50 @@ $schemaPath       = Join-Path $root ".ai-workflow\prompts\review-output-schema.j
 $MaxPacketChars = 900000
 
 $sections = [System.Collections.Generic.List[hashtable]]::new()
-$omitted = [System.Collections.Generic.List[string]]::new()
+# Structured, not plain strings, so an entry can be reliably identified and
+# removed by Path later (see the evidence-vs-omitted dedup pass below) -
+# rendering to "path (reason)" text happens only at the very end.
+$omitted = [System.Collections.Generic.List[hashtable]]::new()
 $reviewedCandidates = [System.Collections.Generic.List[string]]::new()
+# Files that are excluded from the generic reports/ collection pass but are
+# EXPLICITLY, individually allowlisted to be embedded as review evidence
+# anyway (see Add-EvidenceSection). A file appearing here must never also
+# appear in the final omitted list - that self-contradiction is exactly
+# what this structure prevents.
+$embeddedEvidence = [System.Collections.Generic.List[hashtable]]::new()
 
 function Add-Section {
     param([string]$Title, [string]$RelPath, [string]$Content, [int]$Tier)
     $sections.Add(@{ Title = $Title; Path = $RelPath; Content = $Content; Tier = $Tier })
 }
+
+function Add-Omitted {
+    param([string]$RelPath, [string]$Reason)
+    $omitted.Add(@{ Path = $RelPath; Reason = $Reason })
+}
+
+function Add-EvidenceSection {
+    <#
+      The ONLY sanctioned way to embed a file that lives under reports/.
+      RelPath must be one of $EvidenceAllowlist (checked by the caller) -
+      this function does not itself enforce that, so it stays a single,
+      auditable call site rather than a generic "embed anything" escape
+      hatch. Marks RelPath as reviewed AND as embedded evidence; the
+      dedup pass after all sections are built removes it from $omitted
+      even if the generic reports/ exclusion pass added it there first.
+    #>
+    param([string]$RelPath, [string]$Title, [string]$Content, [int]$Tier, [string]$Description)
+    Add-Section -Title $Title -RelPath $RelPath -Content $Content -Tier $Tier
+    $reviewedCandidates.Add($RelPath)
+    $embeddedEvidence.Add(@{ Path = $RelPath; Description = $Description })
+}
+
+# Fixed, explicit allowlist - never a pattern/wildcard - of the only
+# reports/ files ever permitted to be embedded as evidence despite the
+# general reports/ exclusion. Adding a new evidence file requires editing
+# this list AND adding its own Add-EvidenceSection call site, so arbitrary
+# files under reports/ can never bypass exclusion implicitly.
+$EvidenceAllowlist = @("reports/quality-gates-latest.md", "reports/migration-validation-latest.md")
 
 function Get-FenceLang {
     param([string]$Path)
@@ -141,7 +187,7 @@ foreach ($doc in $governingDocs) {
         Add-Section -Title "Governing document: $displayPath" -RelPath $displayPath `
             -Content "NOT FOUND at $displayPath." -Tier 1
         $missingGoverningDocs.Add($displayPath)
-        $omitted.Add("$displayPath (not found on disk)")
+        Add-Omitted -RelPath $displayPath -Reason "not found on disk"
     } else {
         Add-Section -Title "Governing document: $displayPath" -RelPath $displayPath `
             -Content "$fence$(Get-FenceLang $doc)`n$content`n$fence" -Tier 1
@@ -220,25 +266,25 @@ foreach ($rel in $untrackedList) {
     $relNorm = $rel -replace '\\', '/'
 
     if (-not (Test-PathInsideRepoRoot -Root $root -RelativePath $rel)) {
-        $omitted.Add("$relNorm (outside repository root - refused)")
+        Add-Omitted -RelPath $relNorm -Reason "outside repository root - refused"
         continue
     }
     if (Test-ExcludedRelativePath -RelativePath $relNorm) {
-        $omitted.Add("$relNorm (excluded: secret/credential/build-artifact/binary-type path)")
+        Add-Omitted -RelPath $relNorm -Reason "excluded: secret/credential/build-artifact/binary-type path"
         continue
     }
     if (-not (Test-ReviewRelevantPath -RelNorm $relNorm)) {
-        $omitted.Add("$relNorm (not under a reviewed directory or a recognized root config/doc type)")
+        Add-Omitted -RelPath $relNorm -Reason "not under a reviewed directory or a recognized root config/doc type"
         continue
     }
 
     $fullPath = Join-Path $root $rel
     if (-not (Test-Path $fullPath -PathType Leaf)) {
-        $omitted.Add("$relNorm (listed as untracked but not readable as a file)")
+        Add-Omitted -RelPath $relNorm -Reason "listed as untracked but not readable as a file"
         continue
     }
     if (Test-BinaryFile -Path $fullPath) {
-        $omitted.Add("$relNorm (binary file - not embedded as text)")
+        Add-Omitted -RelPath $relNorm -Reason "binary file - not embedded as text"
         continue
     }
 
@@ -270,25 +316,25 @@ foreach ($rel in $trackedModifiedList) {
     $relNorm = $rel -replace '\\', '/'
 
     if (-not (Test-PathInsideRepoRoot -Root $root -RelativePath $rel)) {
-        $omitted.Add("$relNorm (outside repository root - refused)")
+        Add-Omitted -RelPath $relNorm -Reason "outside repository root - refused"
         continue
     }
     if (Test-ExcludedRelativePath -RelativePath $relNorm) {
-        $omitted.Add("$relNorm (excluded: secret/credential/build-artifact/binary-type path)")
+        Add-Omitted -RelPath $relNorm -Reason "excluded: secret/credential/build-artifact/binary-type path"
         continue
     }
     if (-not (Test-ReviewRelevantPath -RelNorm $relNorm)) {
-        $omitted.Add("$relNorm (not under a reviewed directory or a recognized root config/doc type)")
+        Add-Omitted -RelPath $relNorm -Reason "not under a reviewed directory or a recognized root config/doc type"
         continue
     }
 
     $fullPath = Join-Path $root $rel
     if (-not (Test-Path $fullPath -PathType Leaf)) {
-        $omitted.Add("$relNorm (listed as modified but not readable as a file - possibly deleted)")
+        Add-Omitted -RelPath $relNorm -Reason "listed as modified but not readable as a file - possibly deleted"
         continue
     }
     if (Test-BinaryFile -Path $fullPath) {
-        $omitted.Add("$relNorm (binary file - not embedded as text)")
+        Add-Omitted -RelPath $relNorm -Reason "binary file - not embedded as text"
         continue
     }
 
@@ -303,36 +349,59 @@ foreach ($rel in $trackedModifiedList) {
 }
 
 # --- Tier 1: quality-gate report / test output / migration / completion report -----
+# Both paths here are in $EvidenceAllowlist - embedded via Add-EvidenceSection
+# so they are never also left in the final omitted list (see the dedup pass
+# below), even though the generic reports/ collection pass above may have
+# already recorded them there.
 $qualityGatePath = Join-Path $root "reports\quality-gates-latest.md"
 if (Test-Path $qualityGatePath) {
     $qgContent = Get-Content -Raw -Encoding utf8 -Path $qualityGatePath
-    Add-Section -Title "Latest quality-gate report (reports/quality-gates-latest.md)" `
-        -RelPath "reports/quality-gates-latest.md" -Content "$fence`n$qgContent`n$fence" -Tier 1
+    Add-EvidenceSection -RelPath "reports/quality-gates-latest.md" `
+        -Title "Latest quality-gate report (reports/quality-gates-latest.md)" `
+        -Content "$fence`n$qgContent`n$fence" -Tier 1 `
+        -Description "Latest official quality-gate run output (ruff/mypy/pytest/frontend/Docker checks)."
     Add-Section -Title "Test output" -RelPath "(test output)" `
         -Content "Included within the quality-gate report above (see the backend-pytest section)." -Tier 1
-    $reviewedCandidates.Add("reports/quality-gates-latest.md")
 } else {
     Add-Section -Title "Latest quality-gate report" -RelPath "reports/quality-gates-latest.md" `
         -Content "NOT AVAILABLE - reports/quality-gates-latest.md does not exist." -Tier 1
     Add-Section -Title "Test output" -RelPath "(test output)" `
         -Content "NOT AVAILABLE - no quality-gate report to source it from." -Tier 1
-    $omitted.Add("reports/quality-gates-latest.md (not found)")
+    Add-Omitted -RelPath "reports/quality-gates-latest.md" -Reason "not found"
 }
 
 $migrationReportPath = Join-Path $root "reports\migration-validation-latest.md"
 if (Test-Path $migrationReportPath) {
     $migrationContent = Get-Content -Raw -Encoding utf8 -Path $migrationReportPath
-    Add-Section -Title "Migration upgrade/downgrade output (reports/migration-validation-latest.md)" `
-        -RelPath "reports/migration-validation-latest.md" -Content "$fence`n$migrationContent`n$fence" -Tier 1
-    $reviewedCandidates.Add("reports/migration-validation-latest.md")
+    Add-EvidenceSection -RelPath "reports/migration-validation-latest.md" `
+        -Title "Migration upgrade/downgrade output (reports/migration-validation-latest.md)" `
+        -Content "$fence`n$migrationContent`n$fence" -Tier 1 `
+        -Description "Alembic upgrade/downgrade/re-upgrade validation transcript."
 } else {
     Add-Section -Title "Migration upgrade/downgrade output" -RelPath "(migration validation output)" `
         -Content "NOT AVAILABLE - reports/migration-validation-latest.md does not exist." -Tier 1
-    $omitted.Add("reports/migration-validation-latest.md (not found)")
+    Add-Omitted -RelPath "reports/migration-validation-latest.md" -Reason "not found"
 }
 
 Add-Section -Title "Claude completion report" -RelPath "(completion report)" `
     -Content "NOT AVAILABLE - the implementation completion report was communicated in the chat session and was not persisted to a file in this repository." -Tier 1
+
+# ---------------------------------------------------------------------------
+# Evidence-vs-omitted dedup: a file explicitly embedded via
+# Add-EvidenceSection must never also appear in the final omitted list, even
+# though the generic reports/ collection pass (which runs before these
+# dedicated sections) may have already recorded it there under a generic
+# "not under a reviewed directory" reason. Everything else that pass
+# recorded - including this tooling's own self-referential output
+# (review-latest.md, codex-review-*.{md,txt,json} under the task's reports
+# subfolder) - is NOT in $EvidenceAllowlist and stays correctly omitted.
+# ---------------------------------------------------------------------------
+$embeddedPaths = @($embeddedEvidence | ForEach-Object { $_.Path })
+if ($embeddedPaths.Count -gt 0) {
+    $omitted = [System.Collections.Generic.List[hashtable]]::new(
+        [hashtable[]]@($omitted | Where-Object { $embeddedPaths -notcontains $_.Path })
+    )
+}
 
 # ---------------------------------------------------------------------------
 # Size handling: drop lowest-priority (highest Tier number) sections first,
@@ -352,7 +421,7 @@ if ($totalChars -gt $MaxPacketChars) {
     foreach ($candidate in $droppable) {
         if ($totalChars -le $MaxPacketChars) { break }
         $sections.Remove($candidate) | Out-Null
-        $omitted.Add("$($candidate.Path) (dropped: packet exceeded the $MaxPacketChars-character size budget)")
+        Add-Omitted -RelPath $candidate.Path -Reason "dropped: packet exceeded the $MaxPacketChars-character size budget"
         $totalChars = Get-TotalChars -Secs $sections
     }
 }
@@ -379,16 +448,30 @@ if ($finalTotalChars -gt $MaxPacketChars -or $missingGoverningDocs.Count -eq $go
 # Assemble and save the packet + prompt, then invoke Codex
 # ---------------------------------------------------------------------------
 $packetLines = @("# Review packet", "", "Generated for task branch `"$branch`".", "")
-foreach ($s in ($sections | Sort-Object -Property Tier)) {
+foreach ($s in ($sections | Sort-Object -Property Tier, Path)) {
     $packetLines += "## $($s.Title)"
     $packetLines += ""
     $packetLines += $s.Content
     $packetLines += ""
 }
+if ($embeddedEvidence.Count -gt 0) {
+    $packetLines += "## Embedded evidence files"
+    $packetLines += ""
+    $packetLines += "Excluded from the generic reports/ collection pass above, but explicitly"
+    $packetLines += "allowlisted and embedded in full elsewhere in this packet as review"
+    $packetLines += "evidence. These must NOT also appear under `"Omitted files`" below."
+    $packetLines += ""
+    foreach ($e in ($embeddedEvidence | Sort-Object -Property Path)) {
+        $packetLines += "- $($e.Path) - $($e.Description)"
+    }
+    $packetLines += ""
+}
 if ($omitted.Count -gt 0) {
     $packetLines += "## Omitted files"
     $packetLines += ""
-    foreach ($o in $omitted) { $packetLines += "- $o" }
+    foreach ($o in ($omitted | Sort-Object -Property Path)) {
+        $packetLines += "- $($o.Path) ($($o.Reason))"
+    }
     $packetLines += ""
 }
 $packetContent = $packetLines -join "`n"
@@ -396,6 +479,74 @@ Write-Utf8File -Path $packetPath -Content $packetContent
 
 $promptTemplate = Get-Content -Raw -Encoding utf8 -Path (Join-Path $root ".ai-workflow\prompts\review.md")
 Write-Utf8File -Path $promptPath -Content $promptTemplate
+
+if ($ValidateProvenance) {
+    $failures = [System.Collections.Generic.List[string]]::new()
+    $embeddedPathSet = @($embeddedEvidence | ForEach-Object { $_.Path })
+    $omittedPathSet = @($omitted | ForEach-Object { $_.Path })
+    $selfReferential = @(
+        "reports/review-latest.md",
+        "$taskId/codex-review-packet.md", "$taskId/codex-review-prompt.md",
+        "$taskId/codex-review-raw.txt", "$taskId/codex-review-stderr.txt",
+        "$taskId/codex-review.json"
+    )
+
+    # 1 & 5: generic report noise and this tooling's own output stay excluded.
+    foreach ($p in $selfReferential) {
+        $embeddedMatch = @($embeddedPathSet | Where-Object { $_ -like "*$p" -or $_ -eq $p })
+        if ($embeddedMatch.Count -gt 0) {
+            $failures.Add("Self-referential/generic path '$p' was embedded as evidence - it must never be.")
+        }
+    }
+
+    # 2 & 3: migration evidence embedded when present, and never also omitted.
+    if (Test-Path (Join-Path $root "reports\migration-validation-latest.md")) {
+        if ($embeddedPathSet -notcontains "reports/migration-validation-latest.md") {
+            $failures.Add("reports/migration-validation-latest.md exists but was not embedded as evidence.")
+        }
+        if ($omittedPathSet -contains "reports/migration-validation-latest.md") {
+            $failures.Add("reports/migration-validation-latest.md is both embedded as evidence and listed as omitted.")
+        }
+    }
+
+    # 4: quality-gate evidence follows the same rule.
+    if (Test-Path (Join-Path $root "reports\quality-gates-latest.md")) {
+        if ($embeddedPathSet -notcontains "reports/quality-gates-latest.md") {
+            $failures.Add("reports/quality-gates-latest.md exists but was not embedded as evidence.")
+        }
+        if ($omittedPathSet -contains "reports/quality-gates-latest.md") {
+            $failures.Add("reports/quality-gates-latest.md is both embedded as evidence and listed as omitted.")
+        }
+    }
+
+    # 6: no path appears in both embedded-evidence and omitted, for any path.
+    $overlap = @($embeddedPathSet | Where-Object { $omittedPathSet -contains $_ })
+    if ($overlap.Count -gt 0) {
+        $failures.Add("Path(s) appear in both embedded-evidence and omitted: $($overlap -join ', ')")
+    }
+
+    # 7: deterministic ordering - re-running Sort-Object on the same input
+    # twice must produce identical output (the packet renders both lists via
+    # `Sort-Object -Property Path`, so this is what "reproducible packet
+    # ordering" actually reduces to).
+    $sortedOnce = ($omittedPathSet | Sort-Object) -join "|"
+    $sortedTwice = ($omittedPathSet | Sort-Object | Sort-Object) -join "|"
+    if ($sortedOnce -ne $sortedTwice) {
+        $failures.Add("Omitted-file ordering is not deterministic across repeated sorts.")
+    }
+
+    if ($failures.Count -gt 0) {
+        Write-Host "Provenance validation FAILED:"
+        foreach ($f in $failures) { Write-Host "  - $f" }
+        exit 1
+    }
+
+    Write-Host "Provenance validation PASSED:"
+    Write-Host "  - embedded evidence: $($embeddedPathSet -join ', ')"
+    Write-Host "  - omitted: $($omittedPathSet.Count) path(s), none overlapping embedded evidence"
+    Write-Host "  - self-referential/generic report paths correctly excluded from embedded evidence"
+    exit 0
+}
 
 if ($DryRun) {
     Write-Host "Dry run: packet written to $packetPath ($finalTotalChars chars), prompt written to $promptPath."

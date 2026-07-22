@@ -52,8 +52,12 @@ clinic-admin-platform/
    cd backend
    python -m venv .venv
    .venv\Scripts\python -m pip install -e ".[dev]"
-   .venv\Scripts\python -m pytest
+   .venv\Scripts\python -m pytest -m "not integration"
+   cd ..
    ```
+   This runs only the unit tests — no PostgreSQL, no Docker, no database
+   environment variables, no destructive-reset authorization required. See
+   "Running tests" below for integration tests and the full quality gate.
 3. Frontend:
    ```powershell
    cd frontend
