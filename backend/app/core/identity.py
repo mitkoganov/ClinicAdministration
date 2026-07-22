@@ -34,17 +34,42 @@ def get_raw_identity(
     x_tenant_id: str | None = Header(default=None, alias="X-Tenant-Id"),
     settings: Settings = Depends(get_settings),
 ) -> RawIdentity:
-    if not settings.development_identity_enabled:
-        raise AppError(
-            "No identity provider is configured for this environment.",
-            status_code=401,
-        )
-
-    if not x_dev_user_id or not x_tenant_id:
+    identity = _resolve_raw_identity(x_dev_user_id, x_tenant_id, settings)
+    if identity is None:
+        if not settings.development_identity_enabled:
+            raise AppError(
+                "No identity provider is configured for this environment.",
+                status_code=401,
+            )
         raise AppError(
             "Missing required X-Dev-User-Id and/or X-Tenant-Id headers.",
             status_code=401,
         )
+    return identity
+
+
+def try_get_raw_identity(
+    x_dev_user_id: str | None, x_tenant_id: str | None, settings: Settings
+) -> RawIdentity | None:
+    """Same gating and validation as `get_raw_identity`, but returns
+    `None` instead of raising when the development identity provider is
+    disabled or the headers are absent - used only as the fallback branch
+    of `app.core.tenant_context.get_tenant_context`, which tries a real
+    production session first and MUST NOT raise merely because no dev
+    headers happen to be present either. A malformed (present but
+    invalid-UUID) header pair still fails closed with `AppError`, exactly
+    as `get_raw_identity` does - "present but garbage" is never silently
+    treated as "absent"."""
+    return _resolve_raw_identity(x_dev_user_id, x_tenant_id, settings)
+
+
+def _resolve_raw_identity(
+    x_dev_user_id: str | None, x_tenant_id: str | None, settings: Settings
+) -> RawIdentity | None:
+    if not settings.development_identity_enabled:
+        return None
+    if not x_dev_user_id or not x_tenant_id:
+        return None
 
     try:
         user_id = uuid.UUID(x_dev_user_id)

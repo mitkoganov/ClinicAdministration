@@ -45,6 +45,43 @@ class ConflictError(AppError):
         super().__init__(message, status_code=409)
 
 
+class UnauthorizedError(AppError):
+    """Caller has no valid, current authentication (missing/invalid/
+    expired/revoked session, or a login attempt that failed). Deliberately
+    generic - never distinguishes "no such account" from "wrong password"
+    from "account exists but is inactive" (see app.services.auth_service)."""
+
+    def __init__(self, message: str = "Authentication required.") -> None:
+        super().__init__(message, status_code=401)
+
+
+class RateLimitedError(AppError):
+    """Caller has exceeded a bounded rate limit (see app.core.rate_limit).
+    Never reveals whether the underlying account exists."""
+
+    def __init__(self, message: str = "Too many attempts. Please try again later.") -> None:
+        super().__init__(message, status_code=429)
+
+
+class InvalidTokenError(AppError):
+    """A one-time token (password reset / invitation acceptance) is
+    missing, malformed, expired, already consumed, or revoked. Always the
+    same generic message regardless of which specific condition applied -
+    never reveals which."""
+
+    def __init__(self, message: str = "This link is invalid or has expired.") -> None:
+        super().__init__(message, status_code=400)
+
+
+class WeakPasswordError(AppError):
+    """A submitted password fails the documented policy (see
+    app.core.passwords). Carries the specific policy-violation message -
+    this is a validation error, not a secret, so it is safe to return."""
+
+    def __init__(self, message: str = "Password does not meet the required policy.") -> None:
+        super().__init__(message, status_code=422)
+
+
 def register_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(AppError)
     async def handle_app_error(_: Request, exc: AppError) -> JSONResponse:
