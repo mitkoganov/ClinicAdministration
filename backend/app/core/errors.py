@@ -16,6 +16,26 @@ class AppError(Exception):
         super().__init__(message)
 
 
+class NotFoundError(AppError):
+    """Requested resource does not exist within the caller's validated scope.
+
+    Also raised for cross-tenant access attempts, deliberately: a resource
+    that exists but belongs to another tenant must be indistinguishable from
+    one that does not exist at all, to avoid leaking foreign-tenant
+    existence (IDOR/enumeration prevention)."""
+
+    def __init__(self, message: str = "Not found") -> None:
+        super().__init__(message, status_code=404)
+
+
+class ForbiddenError(AppError):
+    """Caller is authenticated and tenant-scoped but lacks the role required
+    for this action."""
+
+    def __init__(self, message: str = "Forbidden") -> None:
+        super().__init__(message, status_code=403)
+
+
 def register_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(AppError)
     async def handle_app_error(_: Request, exc: AppError) -> JSONResponse:

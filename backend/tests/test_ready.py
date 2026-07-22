@@ -1,5 +1,11 @@
 from unittest.mock import MagicMock, patch
 
+import pytest
+
+# `client`/`app` always provision a real db_session (see conftest.py), and
+# the first test below deliberately exercises the real database connection.
+pytestmark = pytest.mark.integration
+
 
 def test_ready_endpoint_all_dependencies_available(client):
     with (

@@ -1,6 +1,6 @@
 from functools import lru_cache
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _SUPPORTED_DB_SCHEMES = ("postgresql+psycopg://", "postgresql+psycopg2://")
@@ -23,6 +23,8 @@ class Settings(BaseSettings):
 
     log_level: str = Field(default="INFO")
 
+    development_identity_enabled: bool = Field(default=False)
+
     @field_validator("database_url")
     @classmethod
     def _validate_database_url(cls, value: str) -> str:
@@ -31,6 +33,16 @@ class Settings(BaseSettings):
                 f"database_url must use one of {_SUPPORTED_DB_SCHEMES}, got: {value!r}"
             )
         return value
+
+    @model_validator(mode="after")
+    def _validate_development_identity(self) -> "Settings":
+        if self.development_identity_enabled and self.environment != "development":
+            raise ValueError(
+                "development_identity_enabled requires environment='development'; "
+                "refusing to start with a non-production-safe identity provider "
+                f"enabled under environment={self.environment!r}"
+            )
+        return self
 
 
 @lru_cache
