@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
 from app.core.authorization import READ_ROLES, require_roles
+from app.core.csrf import require_csrf
 from app.core.tenant_context import TenantContext, get_tenant_context
 from app.db.session import get_db
 from app.schemas.clinic import ClinicRead, ClinicUpdate
@@ -29,7 +30,7 @@ def get_clinic(
     )
 
 
-@router.patch("", response_model=ClinicRead)
+@router.patch("", response_model=ClinicRead, dependencies=[Depends(require_csrf)])
 def update_clinic(
     payload: ClinicUpdate,
     context: TenantContext = Depends(get_tenant_context),

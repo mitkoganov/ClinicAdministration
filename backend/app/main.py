@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 
+from app.api.auth import router as auth_router
 from app.api.clinic import router as clinic_router
 from app.api.health import router as health_router
 from app.api.staff import router as staff_router
@@ -22,6 +23,7 @@ def create_app() -> FastAPI:
 
     register_error_handlers(app)
     app.include_router(health_router)
+    app.include_router(auth_router)
     app.include_router(tenant_context_router)
     app.include_router(tenant_scoped_records_router)
     app.include_router(clinic_router)

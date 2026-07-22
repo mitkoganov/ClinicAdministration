@@ -4,6 +4,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.models.membership import MembershipRole, MembershipStatus, TenantMembership
+from app.models.tenant import Tenant, TenantStatus
 
 
 class MembershipRepository:
@@ -87,6 +88,26 @@ class MembershipRepository:
             membership.status = status
         self._db.flush()
         return membership
+
+    def list_active_for_user(self, user_id: uuid.UUID) -> list[tuple[Tenant, TenantMembership]]:
+        """Every ACTIVE membership this user has in an ACTIVE tenant,
+        across all tenants - used only for the user's own "which clinics
+        can I access" list (see app.api.auth's GET /clinics), never for
+        anything cross-tenant-authorizing. An inactive tenant or inactive
+        membership is silently excluded, not merely flagged: this is what
+        "clinic selection can only ever land on an active membership"
+        means at the query level."""
+        stmt = (
+            select(Tenant, TenantMembership)
+            .join(TenantMembership, TenantMembership.tenant_id == Tenant.id)
+            .where(
+                TenantMembership.user_id == user_id,
+                TenantMembership.status == MembershipStatus.ACTIVE,
+                Tenant.status == TenantStatus.ACTIVE,
+            )
+            .order_by(Tenant.name.asc())
+        )
+        return [(row[0], row[1]) for row in self._db.execute(stmt).all()]
 
     def lock_active_owner_ids(self, tenant_id: uuid.UUID) -> list[uuid.UUID]:
         """Row-locks (`SELECT ... FOR UPDATE`) every currently active OWNER

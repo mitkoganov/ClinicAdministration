@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.orm import Session
 
 from app.core.authorization import STAFF_READ_ROLES, require_roles
+from app.core.csrf import require_csrf
 from app.core.tenant_context import TenantContext, get_tenant_context
 from app.db.session import get_db
 from app.models.membership import MembershipRole, MembershipStatus
@@ -46,7 +47,12 @@ def list_staff(
     )
 
 
-@router.post("", response_model=StaffMemberRead, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "",
+    response_model=StaffMemberRead,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_csrf)],
+)
 def add_staff_member(
     payload: StaffMemberCreate,
     context: TenantContext = Depends(get_tenant_context),
@@ -56,7 +62,9 @@ def add_staff_member(
     return StaffMemberRead.model_validate(membership)
 
 
-@router.patch("/{membership_id}", response_model=StaffMemberRead)
+@router.patch(
+    "/{membership_id}", response_model=StaffMemberRead, dependencies=[Depends(require_csrf)]
+)
 def update_staff_member(
     membership_id: uuid.UUID,
     payload: StaffMemberUpdate,
@@ -69,7 +77,9 @@ def update_staff_member(
     return StaffMemberRead.model_validate(membership)
 
 
-@router.delete("/{membership_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/{membership_id}", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(require_csrf)]
+)
 def remove_staff_member(
     membership_id: uuid.UUID,
     context: TenantContext = Depends(get_tenant_context),
