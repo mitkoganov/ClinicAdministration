@@ -32,9 +32,10 @@ minimal audit abstraction — it does **not** implement any business module
   lowercased, non-alphanumeric runs collapsed to a single hyphen), `status`
   (`active`/`inactive`), timestamps (`DateTime(timezone=True)`).
 * `TenantMembership` (`backend/app/models/membership.py`): connects a
-  `user_id` (a bare UUID column with **no** foreign key — no `User` table
-  exists yet; this is the documented placeholder identifier the future
-  authentication module will replace) to a `tenant_id`, with a `role`
+  `user_id` (a bare UUID column with **no** foreign key — kept
+  unconstrained deliberately rather than adding a cross-migration FK to
+  this already-released migration once `UserAccount` was added in MED-004;
+  see "Authentication and user identity" below) to a `tenant_id`, with a `role`
   (`owner`/`manager`/`operator`/`content_editor`/`auditor`) and a `status`
   (`active`/`inactive`). Unique on `(tenant_id, user_id)`.
 * Status and role enums use `sqlalchemy.Enum(..., native_enum=False)` — a
@@ -224,6 +225,178 @@ history is unchanged.
   operators to see any staff data, so this slice gives them none (403 on
   `GET /api/v1/clinic/staff`) rather than inventing an unused partial view.
 
+## Authentication and user identity
+
+**[implemented — MED-004]** Production login/session foundation, layered on
+top of the tenant/membership domain above and independent of the
+development-only identity provider. This slice adds real user accounts and
+server-side sessions; it does **not** add email delivery, MFA, SSO, or a
+production deployment/observability story — see "Known limitations" below.
+
+### Account and session model
+
+* `UserAccount` (`backend/app/models/user_account.py`): `id` (UUID),
+  `normalized_email` (unique, lowercased/trimmed), `password_hash`
+  (Argon2id, see "Password hashing"), `display_name`, `status`
+  (`active`/`inactive`), timestamps. A `UserAccount` has no required
+  relationship to any `TenantMembership` — an account can exist, and log
+  in, with zero clinic memberships (see task.md: "login може да успее без
+  membership"). Membership rows continue to reference `user_id` as a bare
+  UUID, now meaningfully resolvable to a real account instead of a
+  placeholder header.
+* `AuthSession` (`backend/app/models/auth_session.py`): server-side opaque
+  session record — `id`, `user_id`, `token_hash` (SHA-256 of the raw
+  session token, never the raw token itself), `csrf_token_hash` (see
+  "CSRF protection"), `selected_tenant_id` (nullable — the caller's chosen
+  clinic, stored server-side, never client-asserted per request),
+  `created_at`, `idle_expires_at`, `absolute_expires_at`, `revoked_at`.
+  **The session never caches a role** — role is re-resolved from
+  `TenantMembership` on every request that needs it (see `GET /auth/me`),
+  so a role change or removal takes effect immediately, not at next login.
+* `OneTimeToken` (`backend/app/models/one_time_token.py`): purpose-bound
+  (`password_reset` / `invitation`) single-use token — `id`, `user_id`,
+  `token_hash`, `purpose`, `expires_at`, `used_at`. The raw token is never
+  persisted, logged, or returned in any API response body; it exists only
+  in the URL a user follows (see "Known limitations" on delivery).
+
+### Session lifecycle and cookies
+
+Sessions are **server-side opaque tokens, never JWTs** — no session claim
+is ever decoded client-side or trusted from a client-presented payload.
+`app.core.session_tokens.generate_token()` produces the raw token
+(`secrets.token_urlsafe(32)`); only its SHA-256 hash
+(`hash_token()`) is stored, so a leaked database row cannot be replayed as
+a session by itself. The raw token is set via `Set-Cookie` with
+`HttpOnly`, `SameSite=Lax`, and `Secure` (`session_cookie_secure`,
+default `true` — see "Cookie security fail-closed" below).
+
+* **Idle vs. absolute expiry**: `session_idle_lifetime_hours` (default 24)
+  expires a session unused for that long; `session_absolute_lifetime_hours`
+  (default 7 days) is a hard cap regardless of activity. Both are enforced
+  on every request in `app.core.session_dependency`, fail-closed (an
+  expired-either-way session is treated as no session at all, not
+  silently extended).
+* **Login** (`POST /api/v1/auth/login`) issues a new session + CSRF token
+  pair. **Logout** (`POST /api/v1/auth/logout`) is idempotent — a
+  missing/already-invalid session still clears cookies and returns
+  success, never revealing which condition applied — and revokes the
+  session server-side (`revoked_at`), not just client-side cookie
+  clearing.
+* **Clinic selection** (`POST /api/v1/auth/select-clinic`) re-validates
+  that the caller has an active membership in the requested tenant before
+  storing `selected_tenant_id` on the session row — the same
+  indistinguishable-404 pattern as the tenant-context resolver above
+  applies here (no membership and a nonexistent tenant both reject
+  identically).
+* **Password change** (`POST /api/v1/auth/change-password`) requires the
+  current password and revokes all *other* sessions for that user
+  (`SessionService.revoke_all_for_user`) in the same transaction as the
+  password update — this method deliberately does not commit itself, so
+  the caller controls the transaction boundary and a failed password
+  update cannot leave other sessions revoked.
+
+### Password hashing
+
+`app.core.passwords` uses **Argon2id** (`argon2-cffi`), not bcrypt/PBKDF2.
+Policy (`validate_password_policy`): minimum 12 characters, maximum 256,
+**no forced character-class mixing** (task.md is explicit that composition
+rules are not a hardening measure — length is). `needs_rehash()` lets a
+future parameter-cost increase re-hash existing accounts transparently on
+their next successful login, without a bulk migration.
+
+`verify_password` never raises — a malformed stored hash or unexpected
+input returns `False`, not an exception a caller might mishandle into a
+silent auth bypass. Login always calls `verify_password` against either
+the real stored hash or a precomputed dummy Argon2id hash
+(`_DUMMY_PASSWORD_HASH`, computed once at import time) when the account
+doesn't exist — keeping response timing statistically indistinguishable
+between "wrong password" and "no such account," closing a timing-based
+account-enumeration side channel.
+
+### CSRF protection
+
+`app.core.csrf.require_csrf` implements **double-submit tied server-side
+to the session**, not a bare cookie-equals-header check and not reliance
+on `SameSite` alone (task.md is explicit that `SameSite`-only protection
+is insufficient here). `AuthSession.csrf_token_hash` stores the hash of
+the CSRF token issued at login; the client must echo the raw token via the
+`X-CSRF-Token` header, which the dependency hashes and compares
+(`hmac.compare_digest`) against the session's stored hash — a token from a
+*different* valid session cannot be substituted in, unlike plain
+double-submit. `require_csrf` is a no-op for safe methods and for requests
+with no valid session (the route's own auth dependency independently
+rejects unauthenticated callers regardless) — applied to
+`logout`/`select-clinic`/`change-password` and to the MED-003 mutating
+clinic/staff routes, not to `login`/`password-reset`/`invitation-accept`,
+which have no session yet to tie a token to.
+
+### Login rate limiting
+
+`app.core.rate_limit.RateLimiter` throttles login attempts per
+(normalized email, client IP) pair via a Redis-backed counter
+(`login_rate_limit_max_attempts`, default 5, per
+`login_rate_limit_window_seconds`, default 15 minutes) — a bounded
+sliding window, never a permanent lockout. It is defined against a
+`RateLimitStore` `Protocol`, not a concrete Redis type, so tests inject a
+deterministic in-memory fake instead of requiring Redis. **Fails open on
+Redis outage**: `check_and_consume`/`reset` catch any Redis error and
+allow the request through rather than locking every caller out because a
+cache is unavailable — explicitly documented as a deliberate
+availability-over-strictness tradeoff for this foundation stage, not an
+oversight.
+
+### Dev-identity isolation
+
+The development-only identity provider (`app.core.identity`, see
+"Development identity" above) and real sessions are fully independent
+mechanisms that must never conflict. `app.core.tenant_context.
+get_tenant_context` resolves a real session first — by calling
+`get_current_session_optional` directly inside the function body, not via
+a stacked `Depends` (FastAPI dependencies have no native "try A, fallback
+B" composition) — and only falls back to `X-Dev-User-Id`/`X-Tenant-Id`
+headers when no valid session exists. **A valid session always wins**; a
+dev header can never override or shadow one. This makes every existing
+MED-002/MED-003 tenant-scoped route session-aware automatically, without
+editing those route files.
+
+### Cookie security fail-closed
+
+`Settings._validate_cookie_security` (a `model_validator`, same pattern as
+the existing dev-identity validator) refuses to start at all if
+`session_cookie_secure=False` while `environment != "development"` — a
+non-`Secure` session cookie can only ever exist in local plain-HTTP
+development, never silently in a production-like configuration.
+
+### API endpoints
+
+All under `/api/v1/auth` (`backend/app/api/auth.py`):
+
+| Method & path | Session required | CSRF | Purpose |
+|---|---|---|---|
+| `POST /login` | no | no | Issue session + CSRF cookies |
+| `POST /logout` | optional | yes | Idempotent session revocation |
+| `GET /me` | yes | — | Current user + selected clinic (role re-resolved live) |
+| `GET /clinics` | yes | — | All active clinic memberships for the caller |
+| `POST /select-clinic` | yes | yes | Set `selected_tenant_id` on the session |
+| `POST /change-password` | yes | yes | Verify current password, set new one, revoke other sessions |
+| `POST /password-reset/request` | no | no | Issue a `OneTimeToken` (purpose `password_reset`); response never reveals whether the email exists |
+| `POST /password-reset/confirm` | no | no | Consume the token, set new password |
+| `POST /invitations/accept` | no | no | Consume an invitation `OneTimeToken`, create the account, log in |
+
+### Known limitations
+
+* **No email delivery exists.** Password-reset and invitation tokens are
+  generated and stored server-side, but nothing sends the email
+  containing the reset/invitation link — this slice stops at "the backend
+  can issue and validate the token," matching the same
+  provision-not-invite pattern already documented for MED-003 staff
+  additions. Do not claim otherwise in operator-facing text.
+* **No MFA, no SSO.** Login is single-factor, password-only.
+* **No production deployment/observability work.** Session/cookie config
+  is fail-closed by default, but rollout, secret rotation, and monitoring
+  for the auth subsystem specifically are out of scope for this
+  foundation slice.
+
 ## Deterministic business services
 
 **[planned]** All business actions (creating an appointment, changing a
@@ -270,11 +443,20 @@ handing a conversation to a human operator without losing context.
   matrix and final-owner invariant described in "Clinic and staff
   administration" above. No other business module (practitioners,
   appointments, ...) is implemented on top of it yet.
+* `backend/` production authentication (MED-004) — `UserAccount`/
+  `AuthSession`/`OneTimeToken` models, Argon2id password hashing,
+  server-side opaque sessions, session-tied CSRF double-submit,
+  Redis-backed login rate limiting, and the `/api/v1/auth/*` endpoints
+  described in "Authentication and user identity" above. `get_tenant_context`
+  now resolves a real session before falling back to the development
+  identity provider.
 * `frontend/` — Next.js App Router shell with a landing page that displays
-  backend health status, plus `/settings/clinic` and `/settings/staff` —
-  the first real administration pages, using a client-side development
-  identity picker (localStorage-backed `X-Dev-User-Id`/`X-Tenant-Id`
-  headers) since no authentication UI exists yet.
+  backend health status, `/login`, `/forgot-password`, `/reset-password`,
+  and `/invitations/accept` for the new authentication flow, plus
+  `/settings/clinic` and `/settings/staff` — now session-authenticated
+  (`app/lib/api.ts`), with the development identity picker retained
+  as a local-testing convenience only and never rendered in a production
+  build.
 * `infra/` — Docker Compose definitions for Postgres, Redis, Qdrant, backend,
   frontend.
 
@@ -282,7 +464,7 @@ handing a conversation to a human operator without losing context.
 
 | Module         | Purpose                                                        |
 |----------------|------------------------------------------------------------------|
-| authentication | User/staff login, session management, MFA (future)               |
+| authentication | User/staff login, session management (implemented — see "Authentication and user identity"); MFA/SSO still planned |
 | clinics        | Clinic settings + staff/membership administration (implemented — see "Clinic and staff administration") |
 | practitioners  | Clinical practitioner records and scheduling roles (distinct from staff/membership administration above) |
 | services       | Billable clinical services offered by a clinic                    |

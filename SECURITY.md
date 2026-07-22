@@ -31,8 +31,11 @@ begins.
   and any future API keys.
 * **[implemented — foundation]** The tenant/membership domain, request-level
   tenant context, and the demonstration tenant-scoped repository/service
-  pattern described in `ARCHITECTURE.md` → "Multi-tenancy". Full
-  authentication (login, sessions, MFA) is still **[planned]**.
+  pattern described in `ARCHITECTURE.md` → "Multi-tenancy".
+* **[implemented — MED-004]** Production login/session authentication —
+  see `ARCHITECTURE.md` → "Authentication and user identity" and the
+  "Authentication threat model" section below. MFA and SSO are still
+  **[planned]**.
 
 ## Tenant-boundary threat model
 
@@ -92,6 +95,63 @@ begins.
   **Mitigation:** `Settings` refuses to start at all if this flag is `true`
   while `ENVIRONMENT != "development"` — a fail-closed startup check, not
   a runtime one, and not something request-time logic can silently bypass.
+
+## Authentication threat model
+
+* **Threat: session token theft via database compromise or log leak.**
+  **Mitigation:** only a SHA-256 hash of the session token
+  (`app.core.session_tokens.hash_token`) is ever persisted; the raw token
+  exists only in the `HttpOnly`/`Secure`/`SameSite=Lax` cookie and is never
+  logged, printed, or included in an audit event.
+* **Threat: JWT-style session forgery or client-side tampering.** Sessions
+  are deliberately **opaque server-side tokens, not JWTs** — there is no
+  client-decodable claim to forge; every session is looked up against
+  `AuthSession` on every request and rejected if revoked or expired
+  (idle or absolute).
+* **Threat: CSRF on a state-changing request.** **Mitigation:**
+  `app.core.csrf.require_csrf` is a session-tied double-submit check —
+  the client-supplied `X-CSRF-Token` header must hash-match
+  `AuthSession.csrf_token_hash` for *that specific session*
+  (`hmac.compare_digest`), not merely match a cookie value, so a token
+  belonging to a different valid session cannot be substituted in. Relying
+  on `SameSite` alone was explicitly rejected for this reason (see
+  `ARCHITECTURE.md` → "CSRF protection").
+* **Threat: account-existence enumeration via login timing or response
+  differences.** **Mitigation:** `AuthService.login` always calls
+  `verify_password` against either the real stored hash or a precomputed
+  dummy Argon2id hash, keeping timing statistically indistinguishable
+  between "wrong password" and "no such account"; `password-reset/request`
+  always returns the same success response regardless of whether the
+  email exists.
+* **Threat: credential stuffing / brute-force login.** **Mitigation:**
+  `app.core.rate_limit.RateLimiter` throttles by (normalized email,
+  client IP) via Redis, bounded window not permanent lockout. **Documented
+  tradeoff:** it fails open on a Redis outage — availability is
+  prioritized over strict throttling for this foundation stage; this must
+  be revisited before handling real patient data at scale.
+* **Threat: stolen/leaked password reset or invitation link reuse.**
+  **Mitigation:** `OneTimeToken` rows are purpose-bound
+  (`password_reset`/`invitation`), single-use (`used_at` set atomically on
+  consumption), time-limited
+  (`password_reset_token_lifetime_minutes`/`invitation_token_lifetime_hours`),
+  and only their hash is stored — the raw token is never persisted,
+  logged, or echoed back in any API response.
+* **Threat: password-change or logout leaving other stolen sessions
+  active.** **Mitigation:** `AuthService.change_password` revokes every
+  *other* session for that user in the same transaction as the password
+  update (`SessionService.revoke_all_for_user`).
+* **Threat: dev-identity header used to bypass or shadow a real session.**
+  **Mitigation:** `get_tenant_context` always resolves a real session
+  first; a dev header is only ever consulted when no valid session
+  exists, and can never override one — see `ARCHITECTURE.md` →
+  "Dev-identity isolation". Covered by a dedicated integration test
+  asserting a dev header is ignored whenever a valid session cookie is
+  also present.
+* **Threat: insecure session cookie reaching a production-like
+  environment.** **Mitigation:** `Settings._validate_cookie_security`
+  refuses to start if `session_cookie_secure=False` outside
+  `environment=development` — the same fail-closed-at-startup pattern as
+  the existing dev-identity validator, not a runtime-only check.
 
 ## Development identity restrictions
 
@@ -184,6 +244,16 @@ begins.
   before any production deployment — out of scope for the foundation stage.
 * An incident response runbook must exist before real patient data is
   processed.
+
+## Authentication known limitations
+
+* No email delivery exists for password-reset or invitation links — the
+  backend issues and validates tokens, but nothing sends the email. Do not
+  claim email delivery, MFA, or SSO exist anywhere in operator-facing
+  material until they are actually implemented.
+* No production deployment, secret-rotation, or monitoring work has been
+  done for the auth subsystem specifically; this remains foundation-stage
+  code pending a real threat-model review before real patient data.
 
 ## Threat modeling
 
