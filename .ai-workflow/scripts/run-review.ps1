@@ -33,9 +33,44 @@ if (-not (Test-CommandAvailable "codex")) {
 }
 
 $statusShort = (& git status --short | Out-String).Trim()
-if ([string]::IsNullOrWhiteSpace($statusShort)) {
-    Write-Host "No uncommitted changes to review (git status --short is empty)."
-    exit 0
+
+# reports/ holds only this tooling's own generated output (quality-gate and
+# review transcripts) - never real source - so it must not count as "there
+# are pending changes to review" on its own. Without this, a genuinely
+# clean source tree right after finalizing a task into commits would still
+# look "dirty" purely from these generated files and never take the
+# committed-range fallback below.
+$statusShortExcludingReports = (
+    (& git status --short -- . ":(exclude)reports") | Out-String
+).Trim()
+
+# $diffRangeArg is empty while there are uncommitted SOURCE changes (the
+# original, most common case: review pending work-in-progress against the
+# working tree/index). If those are clean - e.g. right after finalizing a
+# task into commits - fall back to reviewing this branch's committed,
+# not-yet-merged range against its base branch, so "commit, then review"
+# still produces a real review instead of an empty packet with nothing to
+# diff.
+$diffRangeArg = @()
+if ([string]::IsNullOrWhiteSpace($statusShortExcludingReports)) {
+    $config = Get-WorkflowConfig
+    $baseBranch = $null
+    foreach ($candidate in $config.protectedBranches) {
+        & git rev-parse --verify --quiet $candidate *>$null
+        if ($LASTEXITCODE -eq 0) { $baseBranch = $candidate; break }
+    }
+    if (-not $baseBranch) {
+        Write-Host "No uncommitted changes and no protected base branch found locally - nothing to review."
+        exit 0
+    }
+    $mergeBase = (& git merge-base HEAD $baseBranch).Trim()
+    $headRev = (& git rev-parse HEAD).Trim()
+    if ($mergeBase -eq $headRev) {
+        Write-Host "No uncommitted changes and no commits ahead of '$baseBranch' - nothing to review."
+        exit 0
+    }
+    $diffRangeArg = @("$mergeBase..HEAD")
+    Write-Host "Working tree is clean - reviewing the committed range $mergeBase..HEAD against '$baseBranch' instead."
 }
 
 $branch = (& git rev-parse --abbrev-ref HEAD).Trim()
@@ -118,16 +153,16 @@ foreach ($doc in $governingDocs) {
 Add-Section -Title "git status --short" -RelPath "(git status --short)" `
     -Content "$fence`n$statusShort`n$fence" -Tier 1
 
-$diffStat = ((& git diff --stat) | Out-String).Trim()
-if ([string]::IsNullOrWhiteSpace($diffStat)) { $diffStat = "(no diff between HEAD and working tree - all changes are untracked new files; see below)" }
-Add-Section -Title "git diff --stat" -RelPath "(git diff --stat)" `
+$diffStat = ((& git diff --stat @diffRangeArg) | Out-String).Trim()
+if ([string]::IsNullOrWhiteSpace($diffStat)) { $diffStat = "(no diff in range - all changes are untracked new files; see below)" }
+Add-Section -Title "git diff --stat $diffRangeArg" -RelPath "(git diff --stat)" `
     -Content "$fence`n$diffStat`n$fence" -Tier 1
 
 # --- Tier 2: full unified diff ------------------------------------------------
-$fullDiffLines = & git diff --no-ext-diff --unified=80
+$fullDiffLines = & git diff --no-ext-diff --unified=80 @diffRangeArg
 $fullDiff = ($fullDiffLines | Out-String).Trim()
 if ([string]::IsNullOrWhiteSpace($fullDiff)) { $fullDiff = "(empty - no tracked-file changes; all changes are untracked new files, see below)" }
-Add-Section -Title "git diff --no-ext-diff --unified=80 (tracked-file changes)" -RelPath "(git diff)" `
+Add-Section -Title "git diff --no-ext-diff --unified=80 $diffRangeArg (tracked-file changes)" -RelPath "(git diff)" `
     -Content "$fence`ndiff`n$fullDiff`n$fence" -Tier 2
 
 # --- Untracked files: enumerate, then split into relevant/excluded ------------------
@@ -222,12 +257,13 @@ foreach ($relNorm in $relevantFiles) {
     $reviewedCandidates.Add($relNorm)
 }
 
-# --- Tracked, modified files: the diff above is real but only shows
-# hunks - embed full current content too, so the packet actually delivers
-# what this prompt promises ("the full contents of new/changed files"),
-# not just a diff for tracked files. Same relevance/exclusion/binary rules
-# as untracked files above. ------------------------------------------------
-$trackedModifiedAll = @(& git diff --name-only)
+# --- Tracked, changed files (modified, or added-then-committed when
+# $diffRangeArg is set): the diff above is real but only shows hunks -
+# embed full current content too, so the packet actually delivers what this
+# prompt promises ("the full contents of new/changed files"), not just a
+# diff for tracked files. Same relevance/exclusion/binary rules as
+# untracked files above. ------------------------------------------------
+$trackedModifiedAll = @(& git diff --name-only @diffRangeArg)
 $trackedModifiedList = ($trackedModifiedAll | Sort-Object)
 
 foreach ($rel in $trackedModifiedList) {
