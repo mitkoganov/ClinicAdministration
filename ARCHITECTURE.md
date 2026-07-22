@@ -155,6 +155,75 @@ solely to exercise and test the pattern above end to end. It is explicitly
 data — future business modules get their own models that follow this same
 pattern, not this one.
 
+## Clinic and staff administration
+
+**[implemented — MED-003]** The first business-facing vertical slice built
+on the multi-tenant foundation above. "Clinic" is user-facing terminology
+for the existing `Tenant` model — a clinic maps one-to-one to a tenant;
+no separate `clinics` table exists, and the tenant/membership migration
+history is unchanged.
+
+* `GET /api/v1/clinic` / `PATCH /api/v1/clinic`
+  (`backend/app/api/clinic.py`, `app/services/clinic_service.py`) — view/edit
+  the caller's own clinic. Only the display name is editable; `PATCH`
+  schemas (`app/schemas/clinic.py`) use `extra="forbid"` so status, slug, id,
+  and audit metadata can never be set via this endpoint. Only `OWNER` may
+  edit; every other active role may view (see "Authorization flow").
+* `GET/POST /api/v1/clinic/staff`, `PATCH/DELETE
+  /api/v1/clinic/staff/{membership_id}` (`backend/app/api/staff.py`,
+  `app/services/staff_service.py`) — administer `TenantMembership` rows for
+  the caller's own clinic. Listing supports role/status filters and
+  pagination, always additionally scoped by `tenant_id` (see "Repository
+  scoping"). Every membership lookup by id is tenant-scoped in one query,
+  so a cross-tenant or nonexistent `membership_id` returns the identical
+  404 (see "Secure cross-tenant behavior").
+* **Role matrix**: `OWNER` may invite/change/deactivate/remove any role.
+  `MANAGER` may invite only `OPERATOR`/`AUDITOR`, and can never create,
+  promote to, or mutate an `OWNER` membership. `OPERATOR`/`CONTENT_EDITOR`/
+  `AUDITOR` can never mutate staff; `AUDITOR` (plus `OWNER`/`MANAGER`) can
+  read the staff roster, `OPERATOR`/`CONTENT_EDITOR` cannot — that "minimum
+  staff information" view for operators described in task.md is not yet
+  implemented (see "Known limitations" below).
+* **Self-elevation**: no one can use this endpoint to increase their own
+  role's privilege tier (`app.services.staff_service._ROLE_RANK`) — a
+  deliberately coarse, three-tier ranking used only for this one check.
+  Voluntary self-*demotion* (e.g. an owner stepping down to manager) is
+  allowed, subject to the final-owner invariant below.
+* **Final-owner invariant**: a clinic can never end up with zero active
+  owners. Before demoting/deactivating/removing an `OWNER` membership, the
+  service row-locks (`SELECT ... FOR UPDATE`) every currently-active owner
+  membership in that tenant (`MembershipRepository.lock_active_owner_ids`)
+  and rejects with `409 Conflict` if the target is the only one — this
+  closes the race where two concurrent requests each see "not the last
+  owner" a moment before both commit.
+* **Removal is soft deactivation**, not a physical `DELETE FROM`: `status`
+  is already the documented membership lifecycle (see "Membership
+  validation"), a deactivated membership administers nothing (it fails
+  `resolve_membership`'s active-status check immediately), and no other
+  record holds a foreign key to a membership row that a hard delete could
+  break. `DELETE /api/v1/clinic/staff/{id}` and `PATCH ... {"status":
+  "inactive"}` have the same effect on the row; `DELETE` additionally emits
+  a `membership.removed` audit event distinct from `membership.deactivated`.
+* **Audit events**: `clinic.update`, `membership.create`,
+  `membership.role_changed`, `membership.activated`,
+  `membership.deactivated`, `membership.removed` — each following the same
+  commit-then-audit pattern as the MED-002 demonstration service (see
+  "Audit-event flow"), plus a `rejected` event for every insufficient-role,
+  duplicate-membership, and final-owner rejection.
+* `frontend/app/settings/clinic` and `frontend/app/settings/staff` — the
+  first real admin UI pages (see "Implemented components" below).
+
+### Known limitations
+
+* No email-invitation delivery exists. "Adding staff" provisions a
+  membership for a `user_id` the caller already knows (a development/test
+  identity, in this foundation stage) — it is not an invitation flow, and
+  nothing in this slice claims otherwise.
+* `OPERATOR`'s staff visibility is task.md's "minimum staff information
+  explicitly required by the application" — no current feature requires
+  operators to see any staff data, so this slice gives them none (403 on
+  `GET /api/v1/clinic/staff`) rather than inventing an unused partial view.
+
 ## Deterministic business services
 
 **[planned]** All business actions (creating an appointment, changing a
@@ -195,10 +264,17 @@ handing a conversation to a human operator without losing context.
 * `backend/` tenancy foundation — `Tenant`/`TenantMembership` models, request-level
   tenant context resolution, tenant-scoped repository/service/authorization
   pattern, background-job tenant context contract, and a structured-logging
-  audit adapter. See "Multi-tenancy" above. No business module (clinics,
-  practitioners, appointments, ...) is implemented on top of it yet.
+  audit adapter. See "Multi-tenancy" above.
+* `backend/` clinic and staff administration (MED-003) — clinic (tenant)
+  settings view/edit and staff (membership) administration with the role
+  matrix and final-owner invariant described in "Clinic and staff
+  administration" above. No other business module (practitioners,
+  appointments, ...) is implemented on top of it yet.
 * `frontend/` — Next.js App Router shell with a landing page that displays
-  backend health status.
+  backend health status, plus `/settings/clinic` and `/settings/staff` —
+  the first real administration pages, using a client-side development
+  identity picker (localStorage-backed `X-Dev-User-Id`/`X-Tenant-Id`
+  headers) since no authentication UI exists yet.
 * `infra/` — Docker Compose definitions for Postgres, Redis, Qdrant, backend,
   frontend.
 
@@ -207,8 +283,8 @@ handing a conversation to a human operator without losing context.
 | Module         | Purpose                                                        |
 |----------------|------------------------------------------------------------------|
 | authentication | User/staff login, session management, MFA (future)               |
-| clinics        | Individual clinic records under a tenant                          |
-| practitioners  | Clinic staff / practitioners and their roles                      |
+| clinics        | Clinic settings + staff/membership administration (implemented — see "Clinic and staff administration") |
+| practitioners  | Clinical practitioner records and scheduling roles (distinct from staff/membership administration above) |
 | services       | Billable clinical services offered by a clinic                    |
 | schedules      | Practitioner availability and working hours                       |
 | appointments   | Booking, rescheduling, cancellation (deterministic service layer) |

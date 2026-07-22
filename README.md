@@ -73,10 +73,11 @@ clinic-admin-platform/
 ## Multi-tenant foundation (local API testing)
 
 The backend now has a tenant/membership domain and tenant-scoped demo API
-(`/api/v1/tenant-context`, `/api/v1/tenant-resources`) — see
-[ARCHITECTURE.md](ARCHITECTURE.md) → "Multi-tenancy". No real authentication
-exists yet, so local testing uses a **development-only** identity header
-provider that is disabled by default.
+(`/api/v1/tenant-context`, `/api/v1/tenant-resources`), plus clinic and staff
+administration (`/api/v1/clinic`, `/api/v1/clinic/staff`) — see
+[ARCHITECTURE.md](ARCHITECTURE.md) → "Multi-tenancy" and "Clinic and staff
+administration". No real authentication exists yet, so local testing uses a
+**development-only** identity header provider that is disabled by default.
 
 1. Enable it only in a `development` environment (`.env`):
    ```env
@@ -102,6 +103,12 @@ provider that is disabled by default.
    no tenant-provisioning UI or endpoint, so insert them directly (e.g. via
    `psql` or a short Python script using the app's models) before testing.
 4. Run tests — see "Running tests" below for the two supported workflows.
+5. To exercise the admin UI (`/settings/clinic`, `/settings/staff`) against
+   this backend: start the frontend (`npm run dev` in `frontend/`), open
+   either page, and enter the same `X-Dev-User-Id`/`X-Tenant-Id` pair from
+   step 2 into the "Development identity" banner shown at the top — it is
+   stored in the browser's `localStorage` only, never a security boundary,
+   and is attached as headers to every API call the page makes.
 
 ## Running tests
 

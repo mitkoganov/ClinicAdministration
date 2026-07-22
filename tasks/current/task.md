@@ -1,839 +1,230 @@
-# MED-002 — Multi-Tenant Foundation
+# MED-003 — Clinic and Staff Administration
+
+## Preconditions
+
+This task builds on the approved MED-002 multi-tenant foundation
+(`Tenant`/`TenantMembership` models, request-level tenant context
+resolution, tenant-scoped repository/service/authorization pattern,
+background-job tenant context, audit adapter, and the disposable-test-
+database safety infrastructure). PR #1 (MED-002) must be merged into
+`master` before this task starts; implementation happens on
+`feature/med-003-clinic-staff-administration`.
+
+---
 
 ## Objective
 
-Implement the minimum secure multi-tenant foundation for the clinic administration platform.
+Provide secure clinic and staff administration using the tenant,
+membership, authorization, audit, and database-isolation foundations
+delivered by MED-002.
 
-The platform will serve multiple independent healthcare organizations. Every tenant-owned resource must be isolated server-side so that users from one tenant cannot access, modify, enumerate, or infer data belonging to another tenant.
+This task produces a functional vertical slice:
 
-This task establishes the tenant domain, tenant membership, request-level tenant context, authorization checks, repository scoping, database migration, and regression tests.
-
-Do not implement authentication UI, invitations, billing, subscriptions, clinics, practitioners, appointments, or other business modules in this task.
-
----
-
-## Governing documents
-
-Before changing code, read:
-
-* `AGENTS.md`
-* `CLAUDE.md`
-* `ARCHITECTURE.md`
-* `SECURITY.md`
-* `CONTRIBUTING.md`
-* `.ai-workflow/config.json`
-
-Inspect the current backend architecture, database setup, Alembic configuration, dependency injection, API routing, error-handling conventions, and test structure.
-
-Reuse existing conventions wherever they are sound.
-
-Do not redesign unrelated parts of the project.
+* clinic administrators can view and manage their own clinic;
+* authorized users can view and manage staff memberships;
+* users cannot access or infer data belonging to another clinic;
+* the frontend provides a usable administration interface;
+* all state-changing operations are audited.
 
 ---
 
-## Required domain model
+## Domain terminology
 
-### Tenant
-
-Create a persistent `Tenant` entity representing an independent organization using the platform.
-
-Minimum fields:
-
-* `id`
-* `name`
-* `slug`
-* `status`
-* `created_at`
-* `updated_at`
-
-Requirements:
-
-* use the repository's existing ID convention;
-* `slug` must be unique;
-* normalize and validate `slug`;
-* define explicit active and inactive states;
-* timestamps must follow the project's existing timezone convention;
-* avoid soft-delete behavior unless the project already has an established pattern;
-* do not add clinic-specific fields yet.
-
-Recommended tenant statuses:
-
-* `active`
-* `inactive`
-
-Use an enum or constrained representation consistent with the current codebase.
-
-### TenantMembership
-
-Create a persistent `TenantMembership` entity connecting a user identity to a tenant.
-
-Minimum fields:
-
-* `id`
-* `tenant_id`
-* `user_id`
-* `role`
-* `status`
-* `created_at`
-* `updated_at`
-
-Requirements:
-
-* one membership per `tenant_id` and `user_id`;
-* foreign key to `Tenant`;
-* use the current or planned user identifier representation without implementing the full authentication system;
-* do not create a duplicate user model if one already exists;
-* if no user model exists, use a clearly documented placeholder identifier compatible with future authentication;
-* enforce uniqueness at database level;
-* define explicit active and inactive membership states.
-
-Required roles:
-
-* `owner`
-* `manager`
-* `operator`
-* `content_editor`
-* `auditor`
-
-Do not implement a complete RBAC framework yet. Only establish the membership role representation and authorization primitives needed for tenant access.
+The existing `Tenant` model is the persistence and security boundary. In
+user-facing API schemas and frontend copy, the term "clinic" is used
+instead — a clinic maps one-to-one to a tenant. The database tenant model
+and MED-002 migration history are unchanged.
 
 ---
 
-## Tenant context
+## Roles
 
-Implement an explicit request-level tenant context.
+Preserves the existing MED-002 membership roles and their meaning.
 
-The tenant context must contain at least:
+* **Owner** — view/edit clinic settings; view/invite/change-role/
+  activate-deactivate/remove staff. Must not be removable or deactivated
+  if doing so would leave the clinic without an active owner.
+* **Manager** — view clinic settings (cannot edit); view staff; invite
+  only `operator`/`auditor`; activate/deactivate non-owner memberships;
+  remove `operator`/`auditor` memberships. Must never create, promote to,
+  demote, remove, or otherwise mutate an `owner` membership, and must
+  never grant `owner`.
+* **Operator** — views their own active clinic context only; no staff
+  visibility or mutation in this slice (see "Known limitations").
+* **Auditor** — read-only: may view clinic settings and the membership
+  list; must not mutate clinic or membership data.
 
-* authenticated user identifier;
-* selected tenant identifier;
-* validated active membership;
-* membership role.
-
-The context must be established server-side through a dependency or equivalent framework mechanism.
-
-Requirements:
-
-1. The tenant identifier may be supplied through a documented request header or route context for this foundation task.
-2. The tenant identifier must never be trusted by itself.
-3. The server must validate that:
-
-   * the tenant exists;
-   * the tenant is active;
-   * the user has a membership in that tenant;
-   * the membership is active.
-4. The resolved context must use database-backed tenant and membership data.
-5. Request body data must not be allowed to override the validated tenant context.
-6. Missing tenant context must be rejected for tenant-scoped routes.
-7. Invalid tenant context must be rejected consistently.
-8. The dependency must be reusable by future modules.
-9. Do not rely on frontend filtering.
-10. Do not use a global mutable tenant variable.
-
-If authentication is not implemented yet, use a clearly isolated development-only identity provider or test dependency.
-
-The temporary identity mechanism must:
-
-* be explicitly marked as non-production;
-* be replaceable by the future authentication layer;
-* not accept arbitrary identity silently in production configuration;
-* be covered by tests;
-* not weaken the future authorization model.
+Authorization is enforced server-side, inside the service layer (not only
+the API dependency layer) for every rule above, including a rejection of
+self-elevation (a caller can never use these endpoints to increase their
+own role's privilege tier — voluntary self-demotion is allowed).
 
 ---
 
-## Tenant-scoped repository pattern
+## Backend requirements
 
-Create a reusable server-side pattern for tenant-owned database operations.
+### Clinic API
 
-The design must ensure that future repositories cannot accidentally retrieve resources without tenant filtering.
+* `GET /api/v1/clinic` — returns the active clinic represented by the
+  current tenant context (no arbitrary tenant ID accepted from the
+  client) plus the caller's own role.
+* `PATCH /api/v1/clinic` — allows only the display name to change.
+  Request schema uses an explicit allowlist (`extra="forbid"`) so tenant
+  primary key, ownership boundary, internal status, audit metadata,
+  timestamps, and slug can never be set via this endpoint.
 
-At minimum, demonstrate the pattern with a small non-business test resource or internal tenant-scoped example entity.
+### Staff (membership) API
 
-Do not implement clinic, practitioner, patient, conversation, appointment, or medical entities for demonstration purposes.
+* `GET /api/v1/clinic/staff` — deterministic sort, pagination, optional
+  role/status filters, all additionally tenant-scoped.
+* `POST /api/v1/clinic/staff` — creates a membership for an existing
+  development/test `user_id` (see "Known limitations" — this is
+  provisioning, not an email-invitation system). Rejects a duplicate
+  membership for the same `(tenant_id, user_id)` with `409 Conflict`.
+* `PATCH /api/v1/clinic/staff/{membership_id}` — role and/or status
+  change, subject to the role matrix, self-elevation rejection, and the
+  final-owner invariant below.
+* `DELETE /api/v1/clinic/staff/{membership_id}` — soft-deactivates the
+  membership (sets `status=inactive`); this is the documented membership
+  lifecycle already established by MED-002, not a physical row delete.
 
-The demonstration entity may be named something clearly internal, such as:
+Every membership lookup by `membership_id` is a single tenant-scoped
+query — a cross-tenant or nonexistent `membership_id` returns the
+identical generic `404`, never a distinguishing response.
 
-* `TenantResource`
-* `TenantScopedRecord`
-* `TenantNote`
+### Final-owner protection
 
-It must not contain patient or healthcare data.
+A clinic can never end up with zero active owners. Before demoting,
+deactivating, or removing an `owner` membership, the service row-locks
+(`SELECT ... FOR UPDATE`) every currently-active owner membership in that
+tenant and rejects with `409 Conflict` if the target is the only one —
+closing the race where two concurrent requests each individually see
+"not the last owner" a moment before both commit.
 
-Minimum fields:
+### Service and repository boundaries
 
-* `id`
-* `tenant_id`
-* a harmless test value such as `name`
-* `created_at`
-* `updated_at`
+Follows the established `API → service → repository → database`
+architecture: services own business authorization and invariants and
+independently re-derive them from freshly-read rows (never trusting a
+client-supplied role/status for anyone other than the acting caller);
+repositories are tenant-scoped in a single query per method, with no
+generic method that allows a caller to omit tenant scope; tenant context
+comes only from the server-side resolver.
 
-Required repository behavior:
+### Audit requirements
 
-* create within the validated tenant context;
-* get by ID within the validated tenant;
-* list within the validated tenant;
-* update within the validated tenant;
-* delete within the validated tenant;
-* never expose an unscoped repository method for tenant-owned records;
-* tenant ID must be a required server-side argument or come from the validated context;
-* cross-tenant access must not reveal whether the foreign resource exists.
+Emits audit events for: clinic settings updated; membership created;
+membership role changed; membership activated; membership deactivated;
+membership removed; and rejected high-risk administration attempts
+(insufficient role, duplicate membership, final-owner violation).
+Success events are emitted only after the database operation has
+committed — never before, and never if the commit fails. Audit payloads
+contain identifiers and safe metadata only — no passwords, tokens,
+secrets, full request bodies, or sensitive personal/medical data.
 
-Prefer returning `404` for cross-tenant object access if that matches the project's security convention, because it reduces resource enumeration risk.
+### API error behavior
 
-Document the chosen convention.
+Insufficient role → generic `403`. Nonexistent or cross-tenant
+membership → identical generic `404`. Final-owner invariant violation →
+`409 Conflict`. Duplicate membership → `409 Conflict`. Malformed role or
+status → schema validation error (`422`).
 
----
+### Database and migration
 
-## API foundation
+No new tables: "clinic" is the existing `Tenant` model; "staff" is the
+existing `TenantMembership` model. The migration for this task adds only
+two composite indexes on `tenant_memberships` (`tenant_id, role` and
+`tenant_id, status`) to support tenant-scoped, filtered, paginated staff
+listing — the final-active-owner invariant is transactional service logic
+(row locking), not a database constraint, since it depends on runtime
+state across multiple rows.
 
-Add minimal development or internal API routes demonstrating tenant-scoped access.
-
-Suggested route group:
-
-```text
-/api/v1/tenant-context
-/api/v1/tenant-resources
-```
-
-Required behavior:
-
-### Tenant context route
-
-A read-only endpoint may return non-sensitive context information:
-
-* tenant ID;
-* tenant name;
-* membership role;
-* membership status.
-
-Do not expose internal security details, database metadata, or unrelated user data.
-
-### Tenant resource routes
-
-Create minimal CRUD routes for the harmless tenant-scoped demonstration entity.
-
-The routes exist only to validate the architecture and tests.
-
-Requirements:
-
-* all routes require validated tenant context;
-* create operations derive `tenant_id` from context;
-* clients cannot choose or override `tenant_id` in request bodies;
-* reads, updates, and deletes are tenant-scoped;
-* request and response schemas must not expose unnecessary fields;
-* use existing response and error conventions;
-* validate input lengths and formats.
-
----
-
-## Authorization primitives
-
-Implement minimal reusable authorization helpers.
-
-Required helpers:
-
-* require active tenant membership;
-* require one of a set of tenant roles;
-* expose the current membership role to services;
-* reject insufficient roles consistently.
-
-For the demonstration API:
-
-* all active roles may read;
-* `owner`, `manager`, `operator`, and `content_editor` may create and update;
-* only `owner` and `manager` may delete;
-* `auditor` is read-only.
-
-Do not build a complete permission database or policy engine yet.
-
-The implementation must be easily replaceable or extensible by future RBAC and policy modules.
+Migration validation: upgrade from an empty database to head, downgrade
+of this task's revision, re-upgrade to head — executed only against the
+disposable test database, never the normal development database.
 
 ---
 
-## Service layer
+## Frontend requirements
 
-Business actions must pass through deterministic services.
+Two new pages under the existing Next.js App Router shell:
 
-Create a tenant service responsible for:
+* `/settings/clinic` — clinic name/slug/status/current-role display, with
+  an edit form for permitted users (owner only); loading, empty/error,
+  validation, disabled-submitting, and success states.
+* `/settings/staff` — a paginated, role/status-filterable staff table
+  with add/role-change/activate-deactivate/remove actions and
+  confirmation dialogs for deactivation, removal, and privilege-sensitive
+  role changes. The UI hides unavailable actions per the caller's role for
+  usability; the backend independently enforces every rule regardless of
+  what the UI offers.
 
-* retrieving tenants;
-* validating tenant state;
-* retrieving memberships;
-* validating membership state;
-* resolving tenant context.
-
-Create a service for the demonstration tenant resource.
-
-Requirements:
-
-* routes must not contain direct database business logic;
-* services must receive validated tenant context;
-* repositories must enforce tenant scope;
-* role checks must occur before state changes;
-* avoid duplicated tenant-validation logic;
-* do not let schemas or request input decide tenant ownership.
+Since no authentication UI exists yet, both pages use a client-side,
+localStorage-backed development identity picker (`X-Dev-User-Id`/
+`X-Tenant-Id`) — never a security boundary, purely a local-testing
+convenience matching the backend's existing dev-identity mechanism.
 
 ---
 
-## Background-job tenant context
-
-Create a reusable serializable tenant execution context for future background jobs.
-
-It must contain only the minimum identifiers required to revalidate authorization or ownership when a job runs.
-
-Minimum fields:
-
-* `tenant_id`
-* initiating `user_id`
-* optional correlation or request ID
-
-Requirements:
-
-* background-job context must be explicit;
-* absence of tenant context must fail closed for tenant-owned operations;
-* do not serialize database objects or membership objects;
-* document that workers must revalidate relevant tenant state before executing sensitive actions;
-* add tests for missing or invalid background-job tenant context.
-
-Do not implement a full job queue in this task.
-
----
-
-## Audit events
-
-Add a minimal audit abstraction for tenant-sensitive changes.
-
-At minimum, record or emit structured audit events for:
-
-* tenant resource creation;
-* tenant resource update;
-* tenant resource deletion;
-* rejected cross-tenant mutation attempts where safely detectable;
-* rejected insufficient-role mutations.
-
-The audit event must include:
-
-* event type;
-* tenant ID;
-* actor user ID;
-* target resource type;
-* target resource ID when available;
-* timestamp;
-* correlation or request ID when available;
-* outcome.
-
-Do not include:
-
-* secrets;
-* request bodies;
-* sensitive healthcare data;
-* authentication tokens.
-
-If the project does not yet have a persistent audit store, implement a clean audit interface and a safe structured logging adapter suitable for later replacement.
-
-Do not introduce a large audit subsystem in this task.
-
----
-
-## Database migration
-
-Create an Alembic migration for all new persistent entities.
-
-The migration must:
-
-* create tenant-related enums or constraints safely;
-* create `tenants`;
-* create `tenant_memberships`;
-* create the harmless tenant-scoped demonstration table;
-* create foreign keys;
-* create unique constraints;
-* create required indexes;
-* support downgrade;
-* follow existing naming conventions;
-* not modify unrelated tables.
-
-Required constraints and indexes include:
-
-* unique tenant slug;
-* unique tenant membership per tenant and user;
-* index on membership user ID;
-* index on membership tenant ID;
-* index on tenant-scoped resource tenant ID;
-* composite index where useful for tenant and resource lookup.
-
-Validate migration upgrade and downgrade against a disposable development database.
-
----
-
-## Configuration
-
-Add only configuration required by this task.
-
-If a development identity provider is introduced, add explicit environment settings such as:
-
-```text
-DEVELOPMENT_IDENTITY_ENABLED=false
-```
-
-Default behavior must be safe.
-
-Requirements:
-
-* production-like default must not trust arbitrary user headers;
-* development-only behavior must require explicit enabling;
-* add safe examples to `.env.example`;
-* do not create or modify `.env`;
-* do not add real credentials;
-* document configuration in `README.md` only where necessary.
-
----
-
-## Security requirements
-
-The following are mandatory:
-
-1. Tenant isolation must be enforced in backend queries.
-2. A user-supplied tenant ID is not authorization.
-3. Membership must be validated from the database.
-4. Inactive tenants must be rejected.
-5. Inactive memberships must be rejected.
-6. Cross-tenant reads must not disclose foreign resource existence.
-7. Cross-tenant updates and deletes must be rejected.
-8. Tenant IDs in request bodies must be ignored or rejected.
-9. Tenant-scoped services must require explicit validated context.
-10. Background operations must fail closed without tenant context.
-11. Logs must not contain secrets or sensitive payloads.
-12. No global mutable current-tenant state.
-13. No repository method may return all tenant-owned records without scope.
-14. Tests must use at least two tenants.
-15. Tests must use overlapping resource identifiers or equivalent scenarios where practical.
-16. Do not rely solely on UUID unpredictability for security.
-17. Do not introduce insecure development behavior into default production configuration.
-18. Avoid timing or error differences that unnecessarily reveal foreign resource existence.
-19. Do not implement medical or patient data.
-20. Do not weaken existing health, readiness, Docker, lint, type, or test checks.
-
----
-
-## Required test fixtures
-
-Create reusable test fixtures for:
-
-* Tenant A;
-* Tenant B;
-* active user in Tenant A;
-* active user in Tenant B;
-* user with memberships in both tenants;
-* inactive tenant;
-* inactive membership;
-* owner role;
-* manager role;
-* operator role;
-* content editor role;
-* auditor role;
-* tenant resource in Tenant A;
-* tenant resource in Tenant B.
-
-Do not use real names or patient information.
-
----
-
-## Mandatory unit tests
-
-Add unit tests for:
-
-### Tenant service
-
-* active tenant resolves successfully;
-* inactive tenant is rejected;
-* missing tenant is rejected;
-* active membership resolves successfully;
-* missing membership is rejected;
-* inactive membership is rejected;
-* role is exposed correctly.
-
-### Authorization helpers
-
-* allowed role succeeds;
-* disallowed role is rejected;
-* auditor cannot mutate;
-* owner can delete;
-* operator cannot delete;
-* missing context is rejected.
-
-### Tenant resource service
-
-* create derives tenant ID from context;
-* request payload cannot override tenant ID;
-* tenant-scoped get works;
-* foreign-tenant get returns the selected secure response;
-* tenant-scoped update works;
-* foreign-tenant update is rejected;
-* tenant-scoped delete works;
-* foreign-tenant delete is rejected.
-
-### Background-job context
-
-* valid context can be serialized;
-* missing tenant ID is rejected;
-* missing actor ID is rejected where required;
-* invalid tenant state is revalidated before execution;
-* tenant-owned operation without context fails closed.
-
----
-
-## Mandatory integration and API tests
-
-Add integration tests covering:
-
-1. active member accesses own tenant context;
-2. user without membership is rejected;
-3. inactive membership is rejected;
-4. inactive tenant is rejected;
-5. unknown tenant is rejected;
-6. missing tenant header or route context is rejected;
-7. missing development identity is rejected;
-8. Tenant A lists only Tenant A resources;
-9. Tenant B lists only Tenant B resources;
-10. Tenant A cannot read Tenant B resource;
-11. Tenant A cannot update Tenant B resource;
-12. Tenant A cannot delete Tenant B resource;
-13. Tenant A cannot create a resource owned by Tenant B;
-14. request payload containing another `tenant_id` is rejected or safely ignored;
-15. auditor may read;
-16. auditor cannot create;
-17. auditor cannot update;
-18. auditor cannot delete;
-19. operator may create and update;
-20. operator cannot delete;
-21. manager can delete;
-22. owner can delete;
-23. API responses do not expose membership internals unnecessarily;
-24. error responses do not reveal foreign resource existence;
-25. audit event is emitted for successful create;
-26. audit event is emitted for successful update;
-27. audit event is emitted for successful delete;
-28. insufficient-role mutation emits a safe rejection audit event;
-29. existing `/health` still works;
-30. existing `/ready` still works.
-
-Use the real database integration method already established by the project where practical.
-
-Do not replace all integration behavior with mocks.
-
----
-
-## Migration validation
-
-Run and document:
-
-1. migration from an empty database to head;
-2. downgrade of the new revision;
-3. upgrade to head again;
-4. backend startup after migration;
-5. test suite after migration.
-
-Use a disposable local development or test database.
-
-Do not run migrations against any external or production database.
+## Tests
+
+**Unit tests** cover: clinic update authorization; membership role-change
+authorization; manager restrictions (cannot grant/mutate owner); self-
+elevation rejection; the final-owner invariant; duplicate-membership
+handling; active/inactive membership transitions; audit event timing
+(commit-before-success-audit, no success audit on failed commit); schema
+allowlisting; service fail-closed behavior. Tests that exercise the real
+Postgres database (via `db_session`/`tenancy`) live under
+`backend/tests/integration/`, marked `pytest.mark.integration`, regardless
+of whether they test service-layer logic — directory placement reflects
+actual dependency on the database, not the layer under test.
+
+**Integration tests** cover at least: owner view/update own clinic;
+manager view-but-not-edit; operator cannot update clinic settings;
+auditor read-only; owner staff listing; cross-tenant staff never
+appearing; identical cross-tenant/nonexistent membership 404; owner
+adding an allowed membership; duplicate-membership rejection; manager
+cannot grant/mutate owner; operator/auditor cannot manage staff;
+final-owner cannot be demoted/deactivated/removed; role change audited
+only after commit; failed commit emits no success audit; tenant/
+membership deactivation respected immediately; pagination and filters
+remain tenant-scoped.
+
+**Frontend**: no test framework exists in this repository yet, and this
+task does not introduce one solely for itself — verification relies on
+`lint`, `typecheck`, and `production build`, plus a manual smoke check of
+both pages against a live backend.
 
 ---
 
 ## Quality gates
 
-Run all checks configured by the repository.
-
-At minimum, where supported:
-
-```text
-Ruff check
-Ruff formatting check
-mypy
-pytest
-Alembic migration validation
-Docker Compose config validation
-backend image build
-frontend lint
-frontend typecheck
-frontend production build
-git diff --check
-```
-
-Do not skip a failing check.
-
-Do not modify tests merely to hide failures.
-
-If a pre-existing unrelated check fails, document it clearly and prove whether the failure existed before this task.
-
----
-
-## Documentation updates
-
-Update documentation only where necessary.
-
-Required documentation:
-
-### `ARCHITECTURE.md`
-
-Add:
-
-* tenant domain;
-* tenant context resolution;
-* membership validation;
-* repository scoping;
-* authorization flow;
-* background-job tenant context;
-* audit-event flow;
-* secure cross-tenant behavior.
-
-Clearly mark implemented versus planned functionality.
-
-### `SECURITY.md`
-
-Add:
-
-* tenant-boundary threat model;
-* IDOR prevention;
-* tenant enumeration prevention;
-* development identity restrictions;
-* fail-closed background operations;
-* mandatory cross-tenant regression testing.
-
-### `README.md`
-
-Add only the minimum local instructions required to:
-
-* enable the development identity provider;
-* identify the tenant and development user for local API testing;
-* run migrations;
-* run tenant-isolation tests.
-
-Do not expose insecure production instructions.
+Run the official workflow (`.ai-workflow/scripts/run-tests.ps1`) — ruff,
+ruff format, mypy, unit pytest, integration pytest, frontend lint/
+typecheck/build, Docker Compose config validation (including the test
+profile), backend image build, `git diff --check`. Run migration
+upgrade/downgrade/re-upgrade against the disposable test database and
+save the standard evidence report. Run `.ai-workflow/scripts/run-review.ps1`
+and stop for human approval — do not automatically repair Codex findings.
 
 ---
 
 ## Out of scope
 
-Do not implement:
-
-* production authentication;
-* login UI;
-* password handling;
-* OAuth;
-* OpenID Connect;
-* session management;
-* invitation flows;
-* user management UI;
-* billing;
-* subscriptions;
-* clinic locations;
-* practitioners;
-* medical services;
-* schedules;
-* appointments;
-* patient records;
-* conversations;
-* knowledge base;
-* notifications;
-* full audit database;
-* policy engine;
-* Qdrant tenant collections;
-* Redis tenant caching;
-* frontend tenant UI;
-* production deployment;
-* Kubernetes;
-* external APIs.
+Patient records, appointments, billing, clinical workflows, production
+email-invitation delivery, and a production authentication redesign are
+explicitly not part of this task. (Practitioners/clinical-role records
+remain a separate future module, distinct from the staff/membership
+administration implemented here.)
 
 ---
 
-## Acceptance criteria
-
-### AC-01
-
-A valid active member can resolve tenant context for an active tenant.
-
-### AC-02
-
-A user without membership cannot resolve tenant context.
-
-### AC-03
-
-An inactive membership cannot resolve tenant context.
-
-### AC-04
-
-An inactive tenant cannot be used.
-
-### AC-05
-
-A missing or unknown tenant is rejected.
-
-### AC-06
-
-Tenant A cannot list Tenant B resources.
-
-### AC-07
-
-Tenant A cannot read Tenant B resources.
-
-### AC-08
-
-Tenant A cannot update Tenant B resources.
-
-### AC-09
-
-Tenant A cannot delete Tenant B resources.
-
-### AC-10
-
-Clients cannot assign resource ownership through request payloads.
-
-### AC-11
-
-Tenant filtering is enforced server-side in repositories or equivalent data-access boundaries.
-
-### AC-12
-
-No public unscoped tenant-resource repository operation exists.
-
-### AC-13
-
-Role-based mutation restrictions work as specified.
-
-### AC-14
-
-Auditors are read-only.
-
-### AC-15
-
-Background tenant operations fail closed without explicit context.
-
-### AC-16
-
-Tenant-sensitive mutations emit safe audit events.
-
-### AC-17
-
-Database constraints enforce tenant slug uniqueness and membership uniqueness.
-
-### AC-18
-
-Alembic upgrade succeeds on an empty database.
-
-### AC-19
-
-Alembic downgrade of the new revision succeeds.
-
-### AC-20
-
-Re-upgrade succeeds after downgrade.
-
-### AC-21
-
-All new unit tests pass.
-
-### AC-22
-
-All new integration tests pass.
-
-### AC-23
-
-All existing tests continue to pass.
-
-### AC-24
-
-Ruff passes.
-
-### AC-25
-
-mypy passes.
-
-### AC-26
-
-Docker Compose configuration remains valid.
-
-### AC-27
-
-Backend Docker image builds successfully.
-
-### AC-28
-
-Frontend lint, typecheck, and production build remain successful.
-
-### AC-29
-
-Existing `/health` and `/ready` endpoints remain functional.
-
-### AC-30
-
-No secrets, credentials, patient data, or sensitive payloads are added to the repository or logs.
-
-### AC-31
-
-No unrelated application modules are introduced.
-
-### AC-32
-
-No commit, push, merge, or deployment is performed automatically.
-
----
-
-## Implementation process
-
-1. Inspect the repository.
-2. Print a concise implementation plan.
-3. Identify affected files.
-4. Create a task branch if required by the existing workflow.
-5. Implement the smallest coherent solution.
-6. Add migrations.
-7. Add unit tests.
-8. Add integration tests.
-9. Run migration validation.
-10. Run all configured quality gates.
-11. Generate the implementation report.
-12. Stop for Codex and human review.
-
-Do not stop after planning unless a genuine technical blocker prevents safe implementation.
-
-Do not ask for confirmation for ordinary repository-local implementation steps.
-
-Stop and report clearly if:
-
-* the existing architecture conflicts materially with this specification;
-* authentication assumptions cannot be isolated safely;
-* migration history is invalid;
-* the test environment cannot provide meaningful tenant-isolation verification;
-* a requested change would weaken security.
-
----
-
-## Required completion report
-
-Return:
-
-1. final status;
-2. implementation summary;
-3. architecture decisions;
-4. files created;
-5. files modified;
-6. database models added;
-7. migration revision;
-8. API routes added;
-9. authorization rules implemented;
-10. tenant-isolation mechanism;
-11. background-context implementation;
-12. audit implementation;
-13. tests added;
-14. exact commands executed;
-15. exact command results;
-16. migration upgrade result;
-17. migration downgrade result;
-18. Docker validation result;
-19. security considerations;
-20. known limitations;
-21. unresolved issues;
-22. Git diff summary;
-23. current Git status.
-
-Do not claim a command passed unless it was executed and its result was observed.
+## Completion criteria
+
+MED-003 is complete only when: clinic settings are securely available;
+staff memberships can be administered according to the role matrix;
+final-owner protection is enforced; cross-tenant membership access is
+impossible; audit events are transaction-safe; frontend pages build and
+function; migration validation passes; all quality gates pass; Codex
+returns `APPROVED`; no generated reports are committed; nothing is
+pushed, merged, or deployed automatically.

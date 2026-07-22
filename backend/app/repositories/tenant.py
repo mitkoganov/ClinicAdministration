@@ -20,3 +20,11 @@ class TenantRepository:
     def get_by_slug(self, slug: str) -> Tenant | None:
         stmt = select(Tenant).where(Tenant.slug == slug)
         return self._db.execute(stmt).scalar_one_or_none()
+
+    def update_name(self, tenant_id: uuid.UUID, name: str) -> Tenant | None:
+        tenant = self.get_by_id(tenant_id)
+        if tenant is None:
+            return None
+        tenant.name = name
+        self._db.flush()
+        return tenant
