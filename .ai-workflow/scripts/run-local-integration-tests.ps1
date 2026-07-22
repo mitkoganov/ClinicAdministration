@@ -76,19 +76,34 @@ if ($TestDbName -notmatch '_test$' -and $TestDbName -notmatch 'test') {
 
 $testDatabaseUrl = "postgresql+psycopg://${TestUser}:${TestPassword}@${TestHost}:${TestPort}/${TestDbName}"
 
-if ($env:DATABASE_URL -and $env:DATABASE_URL -eq $testDatabaseUrl) {
-    Write-Error "Refusing to authorize destructive reset: TEST_DATABASE_URL would equal the ambient DATABASE_URL."
-    exit 1
-}
-
-Write-Host "Verified: '$ComposeContainer' is the repository's dedicated, disposable test service."
-
 $backend = Join-Path $root "backend"
 $venvPython = Join-Path $backend ".venv\Scripts\python.exe"
 if (-not (Test-Path $venvPython)) {
     Write-Error "backend/.venv not found. Run: python -m venv backend/.venv; backend/.venv/Scripts/python -m pip install -e `"backend[dev]`""
     exit 1
 }
+
+# Canonical same-target check, not a raw string comparison - reuses
+# backend/tests/db_safety.py as the single source of truth so this script
+# and pytest can never drift onto divergent URL-equivalence rules.
+# Rejects (non-zero exit) whenever the two targets are equivalent OR the
+# comparison is ambiguous (e.g. an unresolvable hostname) - both cases must
+# block authorization, never just an exact string match.
+if ($env:DATABASE_URL) {
+    Push-Location $backend
+    try {
+        & $venvPython -m tests.db_safety $env:DATABASE_URL $testDatabaseUrl
+        $comparisonExitCode = $LASTEXITCODE
+    } finally {
+        Pop-Location
+    }
+    if ($comparisonExitCode -ne 0) {
+        Write-Error "Refusing to authorize destructive reset: TEST_DATABASE_URL is canonically equivalent to (or could not be safely distinguished from) the ambient DATABASE_URL."
+        exit 1
+    }
+}
+
+Write-Host "Verified: '$ComposeContainer' is the repository's dedicated, disposable test service."
 
 Write-Host "Running the integration test suite against $TestHost`:$TestPort/$TestDbName..."
 $previousTestDatabaseUrl = $env:TEST_DATABASE_URL
