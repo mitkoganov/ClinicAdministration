@@ -31,10 +31,26 @@ type ClinicContext = { role: MembershipRole };
 
 const ROLES: MembershipRole[] = ["owner", "manager", "operator", "content_editor", "auditor"];
 const PAGE_SIZE = 20;
-// Hides the mutation controls entirely for a role that can never succeed at
-// them - a usability convenience only. The backend independently enforces
-// every rule regardless of what the UI offers.
+// Hides mutation controls entirely for a viewer/target combination that
+// can never succeed - a usability convenience only, mirroring
+// app.services.staff_service's _can_manager_administer_target /
+// _MANAGER_ADMINISTRABLE_ROLES exactly. The backend independently
+// re-derives and enforces every one of these rules regardless of what the
+// UI offers or hides.
 const MANAGE_ROLES = new Set<MembershipRole>(["owner", "manager"]);
+const MANAGER_ADMINISTRABLE_ROLES = new Set<MembershipRole>(["operator", "auditor"]);
+
+function canAdministerTarget(viewerRole: MembershipRole, targetRole: MembershipRole): boolean {
+  if (viewerRole === "owner") return true;
+  if (viewerRole === "manager") return MANAGER_ADMINISTRABLE_ROLES.has(targetRole);
+  return false;
+}
+
+function assignableRolesFor(viewerRole: MembershipRole): MembershipRole[] {
+  if (viewerRole === "owner") return ROLES;
+  if (viewerRole === "manager") return ROLES.filter((r) => MANAGER_ADMINISTRABLE_ROLES.has(r));
+  return [];
+}
 
 export default function StaffPage() {
   const [state, setState] = useState<ListState>({ kind: "loading" });
@@ -170,6 +186,7 @@ export default function StaffPage() {
 
   const { list, viewerRole } = state;
   const canManage = MANAGE_ROLES.has(viewerRole);
+  const assignableRoles = assignableRolesFor(viewerRole);
 
   return (
     <section>
@@ -222,52 +239,61 @@ export default function StaffPage() {
           </tr>
         </thead>
         <tbody>
-          {list.items.map((member) => (
-            <tr key={member.id}>
-              <td>{member.user_id}</td>
-              <td>
-                {canManage ? (
-                  <select
-                    value={member.role}
-                    disabled={pendingRowId === member.id}
-                    onChange={(e) => handleRoleChange(member, e.target.value as MembershipRole)}
-                  >
-                    {ROLES.map((r) => (
-                      <option key={r} value={r}>
-                        {r}
-                      </option>
-                    ))}
-                  </select>
-                ) : (
-                  member.role
-                )}
-              </td>
-              <td>{member.status}</td>
-              <td>{new Date(member.created_at).toLocaleDateString()}</td>
-              <td style={{ display: "flex", gap: "0.5rem" }}>
-                {canManage ? (
-                  <>
-                    <button
-                      type="button"
+          {list.items.map((member) => {
+            const rowCanManage = canManage && canAdministerTarget(viewerRole, member.role);
+            return (
+              <tr key={member.id}>
+                <td>{member.user_id}</td>
+                <td>
+                  {rowCanManage ? (
+                    <select
+                      value={member.role}
                       disabled={pendingRowId === member.id}
-                      onClick={() => handleToggleStatus(member)}
+                      onChange={(e) => handleRoleChange(member, e.target.value as MembershipRole)}
                     >
-                      {member.status === "active" ? "Deactivate" : "Activate"}
-                    </button>
-                    <button
-                      type="button"
-                      disabled={pendingRowId === member.id}
-                      onClick={() => handleRemove(member)}
-                    >
-                      Remove
-                    </button>
-                  </>
-                ) : (
-                  <span>—</span>
-                )}
-              </td>
-            </tr>
-          ))}
+                      {/* member.role itself is always included even if the
+                          viewer couldn't newly assign it, so the select's
+                          current value is always a valid option. */}
+                      {(assignableRoles.includes(member.role)
+                        ? assignableRoles
+                        : [member.role, ...assignableRoles]
+                      ).map((r) => (
+                        <option key={r} value={r}>
+                          {r}
+                        </option>
+                      ))}
+                    </select>
+                  ) : (
+                    member.role
+                  )}
+                </td>
+                <td>{member.status}</td>
+                <td>{new Date(member.created_at).toLocaleDateString()}</td>
+                <td style={{ display: "flex", gap: "0.5rem" }}>
+                  {rowCanManage ? (
+                    <>
+                      <button
+                        type="button"
+                        disabled={pendingRowId === member.id}
+                        onClick={() => handleToggleStatus(member)}
+                      >
+                        {member.status === "active" ? "Deactivate" : "Activate"}
+                      </button>
+                      <button
+                        type="button"
+                        disabled={pendingRowId === member.id}
+                        onClick={() => handleRemove(member)}
+                      >
+                        Remove
+                      </button>
+                    </>
+                  ) : (
+                    <span>—</span>
+                  )}
+                </td>
+              </tr>
+            );
+          })}
         </tbody>
       </table>
 
@@ -309,7 +335,7 @@ export default function StaffPage() {
               onChange={(e) => setNewRole(e.target.value as MembershipRole)}
               disabled={addSubmitting}
             >
-              {ROLES.map((r) => (
+              {assignableRoles.map((r) => (
                 <option key={r} value={r}>
                   {r}
                 </option>

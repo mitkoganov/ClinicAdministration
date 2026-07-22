@@ -102,6 +102,45 @@ def test_manager_cannot_mutate_owner(client, tenancy):
     assert response.status_code == 403
 
 
+def test_manager_cannot_remove_another_manager(client, tenancy):
+    create_response = client.post(
+        STAFF_URL,
+        json={"user_id": str(uuid.uuid4()), "role": "manager"},
+        headers=dev_headers(tenancy.owner_a, tenancy.tenant_a.id),
+    )
+    other_manager_id = create_response.json()["id"]
+
+    response = client.delete(
+        f"{STAFF_URL}/{other_manager_id}",
+        headers=dev_headers(tenancy.manager_a, tenancy.tenant_a.id),
+    )
+
+    assert response.status_code == 403
+
+
+def test_manager_cannot_remove_content_editor(client, tenancy):
+    content_editor_id = _membership_id(client, tenancy, tenancy.content_editor_a)
+
+    response = client.delete(
+        f"{STAFF_URL}/{content_editor_id}",
+        headers=dev_headers(tenancy.manager_a, tenancy.tenant_a.id),
+    )
+
+    assert response.status_code == 403
+
+
+def test_manager_cannot_change_role_of_content_editor(client, tenancy):
+    content_editor_id = _membership_id(client, tenancy, tenancy.content_editor_a)
+
+    response = client.patch(
+        f"{STAFF_URL}/{content_editor_id}",
+        json={"role": "auditor"},
+        headers=dev_headers(tenancy.manager_a, tenancy.tenant_a.id),
+    )
+
+    assert response.status_code == 403
+
+
 def test_operator_cannot_manage_staff(client, tenancy):
     list_response = client.get(
         STAFF_URL, headers=dev_headers(tenancy.operator_a, tenancy.tenant_a.id)

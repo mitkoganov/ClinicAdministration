@@ -173,6 +173,14 @@ def test_manager_cannot_grant_manager(db_session, tenancy):
         service.create(context, uuid.uuid4(), MembershipRole.MANAGER)
 
 
+def test_manager_cannot_grant_content_editor(db_session, tenancy):
+    service = StaffService(db_session)
+    context = _context(tenancy, tenancy.manager_a, MembershipRole.MANAGER)
+
+    with pytest.raises(ForbiddenError):
+        service.create(context, uuid.uuid4(), MembershipRole.CONTENT_EDITOR)
+
+
 def test_operator_cannot_add_staff(db_session, tenancy):
     service = StaffService(db_session)
     context = _context(tenancy, tenancy.operator_a, MembershipRole.OPERATOR)
@@ -228,6 +236,39 @@ def test_manager_can_change_operator_to_auditor(db_session, tenancy):
     updated = service.update(context, target_id, role=MembershipRole.AUDITOR)
 
     assert updated.role == MembershipRole.AUDITOR
+
+
+def test_manager_cannot_change_role_of_another_manager(db_session, tenancy):
+    service = StaffService(db_session)
+    owner_context = _context(tenancy, tenancy.owner_a, MembershipRole.OWNER)
+    other_manager_id = service.create(owner_context, uuid.uuid4(), MembershipRole.MANAGER).id
+
+    manager_context = _context(tenancy, tenancy.manager_a, MembershipRole.MANAGER)
+    with pytest.raises(ForbiddenError):
+        service.update(manager_context, other_manager_id, role=MembershipRole.OPERATOR)
+
+
+def test_manager_cannot_change_role_of_content_editor(db_session, tenancy):
+    service = StaffService(db_session)
+    context = _context(tenancy, tenancy.manager_a, MembershipRole.MANAGER)
+    target_id = _membership_id(db_session, tenancy, tenancy.content_editor_a)
+
+    with pytest.raises(ForbiddenError):
+        service.update(context, target_id, role=MembershipRole.AUDITOR)
+
+
+def test_manager_cannot_administer_own_manager_membership(db_session, tenancy):
+    # A manager's own membership role is MANAGER - not in the manager-
+    # administrable target set - so self-targeting must not be a way to
+    # bypass that restriction.
+    service = StaffService(db_session)
+    manager_membership_id = _membership_id(db_session, tenancy, tenancy.manager_a)
+    context = _context(
+        tenancy, tenancy.manager_a, MembershipRole.MANAGER, membership_id=manager_membership_id
+    )
+
+    with pytest.raises(ForbiddenError):
+        service.update(context, manager_membership_id, status=MembershipStatus.INACTIVE)
 
 
 def test_self_elevation_is_rejected(db_session, tenancy):
@@ -391,6 +432,36 @@ def test_manager_cannot_remove_owner(db_session, tenancy):
 
     with pytest.raises(ForbiddenError):
         service.delete(context, owner_membership_id)
+
+
+def test_manager_cannot_remove_another_manager(db_session, tenancy):
+    service = StaffService(db_session)
+    owner_context = _context(tenancy, tenancy.owner_a, MembershipRole.OWNER)
+    other_manager_id = service.create(owner_context, uuid.uuid4(), MembershipRole.MANAGER).id
+
+    manager_context = _context(tenancy, tenancy.manager_a, MembershipRole.MANAGER)
+    with pytest.raises(ForbiddenError):
+        service.delete(manager_context, other_manager_id)
+
+
+def test_manager_cannot_remove_content_editor(db_session, tenancy):
+    service = StaffService(db_session)
+    context = _context(tenancy, tenancy.manager_a, MembershipRole.MANAGER)
+    content_editor_id = _membership_id(db_session, tenancy, tenancy.content_editor_a)
+
+    with pytest.raises(ForbiddenError):
+        service.delete(context, content_editor_id)
+
+
+def test_manager_cannot_remove_self(db_session, tenancy):
+    service = StaffService(db_session)
+    manager_membership_id = _membership_id(db_session, tenancy, tenancy.manager_a)
+    context = _context(
+        tenancy, tenancy.manager_a, MembershipRole.MANAGER, membership_id=manager_membership_id
+    )
+
+    with pytest.raises(ForbiddenError):
+        service.delete(context, manager_membership_id)
 
 
 def test_operator_cannot_remove_staff(db_session, tenancy):

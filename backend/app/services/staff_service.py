@@ -9,8 +9,11 @@ BEFORE emitting a `SUCCESS` audit event - never after.
 
 Authorization matrix (see tasks/current/task.md "Roles" section):
   * OWNER may invite/change/deactivate/remove any role.
-  * MANAGER may invite only OPERATOR/AUDITOR, may not create or mutate an
-    OWNER, and may not grant OWNER to anyone.
+  * MANAGER may invite, deactivate/activate, change the role of, or remove
+    ONLY memberships whose CURRENT role is OPERATOR or AUDITOR
+    (`_can_manager_administer_target`) - never OWNER, MANAGER, or
+    CONTENT_EDITOR, including their own membership if it is one of those
+    roles. A manager may also never grant OWNER to anyone.
   * OPERATOR/CONTENT_EDITOR/AUDITOR may never mutate staff.
   * No one may elevate their own role (see `_ROLE_RANK` below).
   * The clinic's last active OWNER can never be demoted, deactivated, or
@@ -44,12 +47,20 @@ _ROLE_RANK: dict[MembershipRole, int] = {
     MembershipRole.AUDITOR: 1,
 }
 
-# The only roles a MANAGER (never an OWNER-only restriction) may assign when
-# inviting new staff - task.md: "Manager may invite operator and auditor
-# roles."
-_MANAGER_INVITABLE_ROLES: frozenset[MembershipRole] = frozenset(
+# The only CURRENT target roles a MANAGER may administer at all - for
+# every mutation (create/invite, role change, activate, deactivate,
+# remove), not just delete. A manager targeting an OWNER, MANAGER, or
+# CONTENT_EDITOR membership (including their own, if it is one of those
+# roles) is rejected before any other check runs. Task.md: "Manager may
+# invite operator and auditor roles" generalizes to "may administer only
+# operator/auditor memberships."
+_MANAGER_ADMINISTRABLE_ROLES: frozenset[MembershipRole] = frozenset(
     {MembershipRole.OPERATOR, MembershipRole.AUDITOR}
 )
+
+
+def _can_manager_administer_target(target_role: MembershipRole) -> bool:
+    return target_role in _MANAGER_ADMINISTRABLE_ROLES
 
 
 class StaffService:
@@ -149,7 +160,9 @@ class StaffService:
             raise NotFoundError()
 
         try:
-            if context.role == MembershipRole.MANAGER and target.role == MembershipRole.OWNER:
+            if context.role == MembershipRole.MANAGER and not _can_manager_administer_target(
+                target.role
+            ):
                 raise ForbiddenError("Not permitted to perform this action.")
             if target.role == MembershipRole.OWNER:
                 self._assert_not_last_active_owner(context.tenant_id, membership_id)
@@ -174,7 +187,9 @@ class StaffService:
         self._audit(context, "membership.removed", AuditOutcome.SUCCESS, membership_id)
 
     def _check_can_assign_role(self, context: TenantContext, role: MembershipRole) -> None:
-        if context.role == MembershipRole.MANAGER and role not in _MANAGER_INVITABLE_ROLES:
+        # Invite is a special case of "administering a target": the
+        # not-yet-existing membership's role is treated as the target role.
+        if context.role == MembershipRole.MANAGER and not _can_manager_administer_target(role):
             raise ForbiddenError("Not permitted to perform this action.")
 
     def _validate_update(
@@ -186,7 +201,9 @@ class StaffService:
     ) -> None:
         if role is None and status is None:
             return
-        if context.role == MembershipRole.MANAGER and target.role == MembershipRole.OWNER:
+        if context.role == MembershipRole.MANAGER and not _can_manager_administer_target(
+            target.role
+        ):
             raise ForbiddenError("Not permitted to perform this action.")
         if role is not None:
             if context.role == MembershipRole.MANAGER and role == MembershipRole.OWNER:
