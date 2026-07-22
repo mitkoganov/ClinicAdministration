@@ -21,7 +21,7 @@ begins.
 * No secret is read or displayed by AI coding agents operating in this
   repository (see `AGENTS.md`).
 
-## Access control (planned, once auth/tenants modules exist)
+## Access control
 
 * Authorization decisions are made **server-side**, never trusted from client
   input.
@@ -29,6 +29,94 @@ begins.
   query — a missing or forged tenant identifier must fail closed.
 * Principle of least privilege applies to database roles, service accounts,
   and any future API keys.
+* **[implemented — foundation]** The tenant/membership domain, request-level
+  tenant context, and the demonstration tenant-scoped repository/service
+  pattern described in `ARCHITECTURE.md` → "Multi-tenancy". Full
+  authentication (login, sessions, MFA) is still **[planned]**.
+
+## Tenant-boundary threat model
+
+* **Threat: cross-tenant data access (IDOR).** A caller with a valid,
+  active membership in Tenant A supplies or guesses an identifier belonging
+  to a resource in Tenant B. **Mitigation:** every tenant-owned repository
+  method issues a single query with `tenant_id` in the `WHERE` clause (see
+  `app.repositories.tenant_scoped_record`) — there is no method that looks
+  a row up by `id` alone, so a foreign-tenant row and a nonexistent row are
+  structurally indistinguishable to the caller, not just filtered
+  after the fact.
+* **Threat: tenant/resource enumeration via response differences.** An
+  attacker probes whether a tenant or resource exists by comparing error
+  codes, error messages, or timing between "doesn't exist" and "exists but
+  belongs to someone else." **Mitigation:** every such failure returns the
+  identical `404 {"detail": "Not found"}`-shaped response (`NotFoundError`,
+  never `403`) — see `app.core.tenant_context.get_tenant_context` and
+  `app.services.tenant_scoped_record_service`. Do not add a route or check
+  that returns a different status or message for "foreign tenant" versus
+  "missing" without deliberately re-reviewing this threat model.
+* **Threat: client-supplied tenant/ownership override.** A caller sends a
+  `tenant_id` in a request header, route, or JSON body hoping it will be
+  trusted. **Mitigation:** the tenant identifier from a header is only ever
+  a *claim*, re-validated against the database on every request
+  (`resolve_tenant_context`); request body schemas (e.g.
+  `TenantScopedRecordCreate`) have no `tenant_id` field at all, so there is
+  nothing for a client to override — ownership is always derived
+  server-side from the validated context.
+* **Threat: insufficient-role privilege escalation.** A caller with a
+  read-only or lesser role attempts a mutation. **Mitigation:** the role
+  matrix (`app.core.authorization`) is enforced **inside the service
+  layer**, not only at the API dependency layer — this is deliberate: a
+  service must stay safe to call from any future caller (e.g. a background
+  job invoked outside the FastAPI dependency graph), and every rejected
+  mutation attempt (cross-tenant or insufficient-role) is captured as a
+  rejected audit event.
+* **Threat: development identity provider reaching a real environment.**
+  `DEVELOPMENT_IDENTITY_ENABLED=true` in a production-like configuration
+  would let any caller assert an arbitrary user/tenant via headers.
+  **Mitigation:** `Settings` refuses to start at all if this flag is `true`
+  while `ENVIRONMENT != "development"` — a fail-closed startup check, not
+  a runtime one, and not something request-time logic can silently bypass.
+
+## Development identity restrictions
+
+* The `X-Dev-User-Id` / `X-Tenant-Id` header-based identity provider
+  (`app.core.identity`) exists only to unblock tenant-context development
+  and testing before real authentication exists. It is disabled by default.
+* It must never be enabled in any environment other than
+  `ENVIRONMENT=development` — enforced at application startup, not left to
+  operator discipline.
+* Values it extracts are never trusted as authorization by themselves; they
+  are always re-validated against the database before any access is
+  granted.
+* It is covered by tests, including the case where it is disabled and
+  headers are supplied anyway (must still reject).
+
+## Fail-closed background operations
+
+* The background-job tenant context (`app.core.background_context`) fails
+  closed: constructing one from an incomplete or malformed payload (missing
+  `tenant_id` or `actor_user_id`, invalid identifiers) raises rather than
+  returning a partially-valid context.
+* A worker receiving a `BackgroundTenantContext` must re-resolve and
+  revalidate tenant and membership state via `app.services.tenant_service`
+  before performing any tenant-owned action — the context alone is never
+  sufficient authorization, exactly like the request-level `TenantContext`.
+* No job queue exists yet; this defines the contract a future one must
+  honor.
+
+## Mandatory cross-tenant regression testing
+
+* Every tenant-isolation-relevant test fixture set uses **at least two
+  tenants** with **overlapping role coverage**, per
+  `backend/tests/factories.py` (`Tenancy`): Tenant A and Tenant B, a user
+  with active membership in both, an inactive tenant, an inactive
+  membership, and one `TenantScopedRecord` per tenant.
+* `backend/tests/integration/test_tenant_scoped_records_api.py` asserts
+  that a cross-tenant 404 and a missing-resource 404 return byte-identical
+  response bodies (`test_error_responses_do_not_distinguish_missing_from_foreign_tenant`)
+  — a regression here would silently reopen the enumeration threat above.
+* Any new tenant-owned resource or route must add the equivalent
+  isolation, role-matrix, and audit-event tests before merging — do not
+  rely on manual testing for this class of bug.
 
 ## Logging
 
@@ -40,8 +128,15 @@ begins.
 
 ## Audit
 
-* Once the `audit` module exists, every state-changing business action must
-  produce an audit record capturing actor, tenant, action, and timestamp.
+* Once the `audit` module (a persistent, immutable store) exists, every
+  state-changing business action must produce an audit record capturing
+  actor, tenant, action, and timestamp.
+* **[implemented — foundation, interim]** `app.core.audit.emit_audit_event`
+  is a structured-logging adapter behind a stable call site — see
+  "Audit-event flow" in `ARCHITECTURE.md`. It already captures event type,
+  tenant id, actor user id, target resource type/id, outcome, timestamp,
+  and correlation id for every tenant-scoped mutation (success and
+  rejection), but is not yet a durable/immutable store.
 
 ## AI-specific restrictions
 
