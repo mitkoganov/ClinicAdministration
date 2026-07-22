@@ -80,6 +80,43 @@ def test_duplicate_membership_is_rejected(client, tenancy):
     assert response.status_code == 409
 
 
+def test_race_duplicate_membership_returns_identical_409_body(client, tenancy, monkeypatch):
+    # A real database-level unique-constraint violation (pre-check
+    # bypassed, as if a concurrent request had just committed the same
+    # membership) must return the exact same 409 body as the ordinary
+    # pre-check-detected duplicate - never distinguishing "pre-check" from
+    # "race" to the caller.
+    precheck_response = client.post(
+        STAFF_URL,
+        json={"user_id": str(tenancy.manager_a), "role": "operator"},
+        headers=dev_headers(tenancy.owner_a, tenancy.tenant_a.id),
+    )
+
+    from app.repositories.membership import MembershipRepository
+
+    original_get_membership = MembershipRepository.get_membership
+
+    def _pretend_no_existing_membership(self, tenant_id, user_id):
+        # Only fake "not found" for the specific (tenant, user) pair this
+        # test is racing against - every other call (including the
+        # caller's own tenant-context/membership resolution) must keep
+        # behaving normally, or this would incorrectly break authentication
+        # instead of exercising the create() pre-check race.
+        if tenant_id == tenancy.tenant_a.id and user_id == tenancy.manager_a:
+            return None
+        return original_get_membership(self, tenant_id, user_id)
+
+    monkeypatch.setattr(MembershipRepository, "get_membership", _pretend_no_existing_membership)
+    race_response = client.post(
+        STAFF_URL,
+        json={"user_id": str(tenancy.manager_a), "role": "operator"},
+        headers=dev_headers(tenancy.owner_a, tenancy.tenant_a.id),
+    )
+
+    assert precheck_response.status_code == race_response.status_code == 409
+    assert precheck_response.json() == race_response.json()
+
+
 def test_manager_cannot_grant_owner(client, tenancy):
     response = client.post(
         STAFF_URL,

@@ -29,6 +29,7 @@ Authorization matrix (see tasks/current/task.md "Roles" section):
 
 import uuid
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.audit import AuditEvent, AuditOutcome, emit_audit_event
@@ -39,6 +40,27 @@ from app.models.membership import MembershipRole, MembershipStatus, TenantMember
 from app.repositories.membership import MembershipRepository
 
 _RESOURCE_TYPE = "membership"
+
+# Must match app.models.membership.TenantMembership's UniqueConstraint name
+# exactly - this is how a duplicate-membership race (both requests pass the
+# pre-check in `create()`, one loses at the database) is distinguished from
+# any other IntegrityError, so only this specific violation is ever
+# translated into a 409 (see `_is_duplicate_membership_violation`).
+_MEMBERSHIP_UNIQUE_CONSTRAINT = "uq_tenant_memberships_tenant_user"
+
+
+def _is_duplicate_membership_violation(exc: IntegrityError) -> bool:
+    """True only for the `(tenant_id, user_id)` unique-constraint violation
+    - never for any other integrity error - so a genuinely unexpected
+    database integrity failure still surfaces as an unhandled error
+    instead of being silently mislabeled as a duplicate-membership
+    conflict. Relies on the driver's structured constraint-name diagnostic
+    (psycopg's `.diag.constraint_name`), never on parsing the free-text
+    error message, which is not a stable contract across Postgres/driver
+    versions."""
+    diag = getattr(exc.orig, "diag", None)
+    return getattr(diag, "constraint_name", None) == _MEMBERSHIP_UNIQUE_CONSTRAINT
+
 
 # Coarse privilege ranking used only to reject SELF role changes that would
 # increase the caller's own privilege ("self-elevation"). It is deliberately
@@ -103,11 +125,25 @@ class StaffService:
             self._audit(context, "membership.create", AuditOutcome.REJECTED)
             raise
 
+        # Fast, friendly rejection for the common case - but the database's
+        # unique constraint is the actual arbiter: two concurrent requests
+        # for the same (tenant_id, user_id) can both pass this read, so the
+        # insert below can still race and must be handled just as safely.
         if self._repo.get_membership(context.tenant_id, user_id) is not None:
             self._audit(context, "membership.create", AuditOutcome.REJECTED)
             raise ConflictError("A membership already exists for this user in this clinic.")
 
-        membership = self._repo.create(context.tenant_id, user_id, role)
+        try:
+            membership = self._repo.create(context.tenant_id, user_id, role)
+        except IntegrityError as exc:
+            self._db.rollback()
+            if not _is_duplicate_membership_violation(exc):
+                raise
+            self._audit(context, "membership.create", AuditOutcome.REJECTED)
+            raise ConflictError(
+                "A membership already exists for this user in this clinic."
+            ) from exc
+
         self._db.commit()
         self._audit(context, "membership.create", AuditOutcome.SUCCESS, membership.id)
         return membership

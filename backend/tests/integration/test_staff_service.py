@@ -146,6 +146,114 @@ def test_duplicate_membership_is_rejected(db_session, tenancy):
         service.create(context, tenancy.manager_a, MembershipRole.OPERATOR)
 
 
+def test_duplicate_membership_in_another_tenant_is_allowed(db_session, tenancy):
+    # The same user_id already has a membership in tenant_a - a brand new
+    # membership for that same user in tenant_b must not be blocked by
+    # anything targeting tenant_a's row (tenant isolation, not just
+    # uniqueness).
+    service = StaffService(db_session)
+    context = _context(tenancy, tenancy.owner_b, MembershipRole.OWNER, tenant=tenancy.tenant_b)
+
+    membership = service.create(context, tenancy.manager_a, MembershipRole.OPERATOR)
+
+    assert membership.tenant_id == tenancy.tenant_b.id
+
+
+def test_create_race_at_the_database_translates_to_conflict(db_session, tenancy, monkeypatch):
+    # Simulates the exact race the fix targets: a concurrent request's
+    # insert has already committed a membership for this (tenant_id,
+    # user_id) by the time this request's own insert executes, but this
+    # request's pre-check ran before that commit and saw nothing - forcing
+    # a REAL PostgreSQL unique-constraint violation on flush, not a mocked
+    # exception. `tenancy.manager_a` already has a real membership row in
+    # tenant_a (created by the `tenancy` fixture itself), which is what the
+    # insert below collides with.
+    from sqlalchemy import select
+
+    from app.repositories.membership import MembershipRepository
+
+    monkeypatch.setattr(
+        MembershipRepository, "get_membership", lambda self, tenant_id, user_id: None
+    )
+
+    service = StaffService(db_session)
+    context = _context(tenancy, tenancy.owner_a, MembershipRole.OWNER)
+
+    with (
+        patch("app.services.staff_service.emit_audit_event") as mock_emit_audit_event,
+        pytest.raises(ConflictError),
+    ):
+        service.create(context, tenancy.manager_a, MembershipRole.OPERATOR)
+
+    events = [call.args[0] for call in mock_emit_audit_event.call_args_list]
+    assert len(events) == 1
+    assert events[0].event_type == "membership.create"
+    assert events[0].outcome == AuditOutcome.REJECTED
+
+    # The session must remain usable after the rollback triggered by the
+    # real IntegrityError - a fresh query must succeed rather than raising
+    # (e.g. SQLAlchemy's "This Session's transaction has been rolled back"
+    # PendingRollbackError, which is exactly what an un-recovered aborted
+    # transaction would raise here).
+    assert db_session.execute(select(1)).scalar_one() == 1
+
+
+def test_create_injected_integrity_error_translates_to_conflict(db_session, tenancy):
+    # Deterministic counterpart to the real-violation test above: proves
+    # the translation logic itself (constraint-name matching) without
+    # depending on a real database round-trip to produce the error.
+    from sqlalchemy.exc import IntegrityError
+
+    from app.services.staff_service import _MEMBERSHIP_UNIQUE_CONSTRAINT
+
+    class _FakeDiag:
+        constraint_name = _MEMBERSHIP_UNIQUE_CONSTRAINT
+
+    class _FakeOrig:
+        diag = _FakeDiag()
+
+    service = StaffService(db_session)
+    context = _context(tenancy, tenancy.owner_a, MembershipRole.OWNER)
+    fake_error = IntegrityError("INSERT ...", {}, _FakeOrig())
+
+    with (
+        patch.object(service._repo, "create", side_effect=fake_error),
+        patch("app.services.staff_service.emit_audit_event") as mock_emit_audit_event,
+        pytest.raises(ConflictError),
+    ):
+        service.create(context, uuid.uuid4(), MembershipRole.OPERATOR)
+
+    success_events = [
+        call.args[0]
+        for call in mock_emit_audit_event.call_args_list
+        if call.args[0].outcome == AuditOutcome.SUCCESS
+    ]
+    assert success_events == []
+
+
+def test_unrelated_integrity_error_is_not_masked_as_duplicate(db_session, tenancy):
+    # A different constraint name (or none at all) must never be
+    # reinterpreted as a duplicate-membership conflict - only the exact
+    # (tenant_id, user_id) unique constraint gets the 409 translation.
+    from sqlalchemy.exc import IntegrityError
+
+    class _FakeDiag:
+        constraint_name = "some_other_constraint"
+
+    class _FakeOrig:
+        diag = _FakeDiag()
+
+    service = StaffService(db_session)
+    context = _context(tenancy, tenancy.owner_a, MembershipRole.OWNER)
+    fake_error = IntegrityError("INSERT ...", {}, _FakeOrig())
+
+    with (
+        patch.object(service._repo, "create", side_effect=fake_error),
+        pytest.raises(IntegrityError),
+    ):
+        service.create(context, uuid.uuid4(), MembershipRole.OPERATOR)
+
+
 def test_manager_can_add_operator_and_auditor(db_session, tenancy):
     service = StaffService(db_session)
     context = _context(tenancy, tenancy.manager_a, MembershipRole.MANAGER)
