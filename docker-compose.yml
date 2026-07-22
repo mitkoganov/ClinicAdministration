@@ -20,6 +20,34 @@ services:
     networks:
       - clinic-net
 
+  # Dedicated, disposable test-only database for the backend integration
+  # test suite. Never started by a plain `docker compose up` - only via
+  # `docker compose --profile test up -d postgres-test` (see
+  # .ai-workflow/scripts/run-local-integration-tests.ps1, the only script
+  # allowed to authorize destructive test setup against it). Uses tmpfs, not
+  # a named volume: it never persists and never shares storage with the
+  # `postgres` service above. Keep POSTGRES_DB/credentials here in sync with
+  # run-local-integration-tests.ps1's constants if either changes.
+  postgres-test:
+    image: postgres:17-alpine
+    restart: "no"
+    profiles: ["test"]
+    environment:
+      POSTGRES_USER: clinic
+      POSTGRES_PASSWORD: clinic
+      POSTGRES_DB: clinic_admin_test
+    ports:
+      - "5555:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U clinic -d clinic_admin_test"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - clinic-net
+
   redis:
     image: redis:7-alpine
     restart: unless-stopped
