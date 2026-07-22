@@ -26,6 +26,22 @@ WRITE_ROLES: frozenset[MembershipRole] = frozenset(
 )
 DELETE_ROLES: frozenset[MembershipRole] = frozenset({MembershipRole.OWNER, MembershipRole.MANAGER})
 
+# --- MED-003: clinic and staff administration -----------------------------
+# Only the owner may edit clinic settings (the membership role matrix in
+# task.md gives managers view-only access to clinic settings).
+CLINIC_WRITE_ROLES: frozenset[MembershipRole] = frozenset({MembershipRole.OWNER})
+# Operators and content editors get no staff-roster visibility in this
+# slice (task.md scopes operator staff visibility down to "the minimum
+# staff information explicitly required by the application", which no
+# current feature needs yet - see ARCHITECTURE.md's MED-003 section for the
+# documented limitation).
+STAFF_READ_ROLES: frozenset[MembershipRole] = frozenset(
+    {MembershipRole.OWNER, MembershipRole.MANAGER, MembershipRole.AUDITOR}
+)
+STAFF_MANAGE_ROLES: frozenset[MembershipRole] = frozenset(
+    {MembershipRole.OWNER, MembershipRole.MANAGER}
+)
+
 
 def require_role(context: TenantContext | None, allowed: frozenset[MembershipRole]) -> None:
     """Fails closed: a missing context is rejected the same way a

@@ -2,7 +2,15 @@ import uuid
 
 import pytest
 
-from app.core.authorization import DELETE_ROLES, READ_ROLES, WRITE_ROLES, require_role
+from app.core.authorization import (
+    CLINIC_WRITE_ROLES,
+    DELETE_ROLES,
+    READ_ROLES,
+    STAFF_MANAGE_ROLES,
+    STAFF_READ_ROLES,
+    WRITE_ROLES,
+    require_role,
+)
 from app.core.errors import ForbiddenError
 from app.core.tenant_context import TenantContext
 from app.models.membership import MembershipRole, MembershipStatus
@@ -55,6 +63,34 @@ def test_operator_cannot_delete():
 def test_missing_context_is_rejected():
     with pytest.raises(ForbiddenError):
         require_role(None, WRITE_ROLES)
+
+
+def test_only_owner_can_write_clinic_settings():
+    require_role(_context(MembershipRole.OWNER), CLINIC_WRITE_ROLES)
+    for role in (
+        MembershipRole.MANAGER,
+        MembershipRole.OPERATOR,
+        MembershipRole.CONTENT_EDITOR,
+        MembershipRole.AUDITOR,
+    ):
+        with pytest.raises(ForbiddenError):
+            require_role(_context(role), CLINIC_WRITE_ROLES)
+
+
+def test_staff_read_roles_exclude_operator_and_content_editor():
+    for role in (MembershipRole.OWNER, MembershipRole.MANAGER, MembershipRole.AUDITOR):
+        require_role(_context(role), STAFF_READ_ROLES)
+    for role in (MembershipRole.OPERATOR, MembershipRole.CONTENT_EDITOR):
+        with pytest.raises(ForbiddenError):
+            require_role(_context(role), STAFF_READ_ROLES)
+
+
+def test_staff_manage_roles_are_owner_and_manager_only():
+    require_role(_context(MembershipRole.OWNER), STAFF_MANAGE_ROLES)
+    require_role(_context(MembershipRole.MANAGER), STAFF_MANAGE_ROLES)
+    for role in (MembershipRole.OPERATOR, MembershipRole.CONTENT_EDITOR, MembershipRole.AUDITOR):
+        with pytest.raises(ForbiddenError):
+            require_role(_context(role), STAFF_MANAGE_ROLES)
 
 
 def test_missing_context_does_not_raise_attribute_error():

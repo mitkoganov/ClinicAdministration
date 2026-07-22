@@ -69,6 +69,23 @@ begins.
   job invoked outside the FastAPI dependency graph), and every rejected
   mutation attempt (cross-tenant or insufficient-role) is captured as a
   rejected audit event.
+* **Threat: a clinic left with no active owner.** A demote/deactivate/
+  remove request targets a clinic's last active `OWNER` membership,
+  including via two concurrent requests that each individually see "not
+  the last owner" a moment before both commit. **Mitigation:**
+  `StaffService` row-locks (`SELECT ... FOR UPDATE`) every active owner
+  membership in the tenant before deciding (`MembershipRepository.
+  lock_active_owner_ids`), and rejects with `409 Conflict` if the target
+  is the only one — the second of two concurrent requests blocks on the
+  lock and re-evaluates against the first request's already-committed
+  result, not a stale read.
+* **Threat: self-elevation and manager over-reach.** A caller mutates their
+  own membership to a higher-privilege role, or a `MANAGER` grants/mutates
+  an `OWNER` membership (their own or someone else's) beyond what the role
+  matrix in task.md permits. **Mitigation:** `StaffService` independently
+  re-derives both checks from the target's *current* role read fresh from
+  the database — never from the request payload — before applying any
+  change; see `app.services.staff_service._validate_update`.
 * **Threat: development identity provider reaching a real environment.**
   `DEVELOPMENT_IDENTITY_ENABLED=true` in a production-like configuration
   would let any caller assert an arbitrary user/tenant via headers.

@@ -34,6 +34,12 @@ class TenantMembership(Base):
         UniqueConstraint("tenant_id", "user_id", name="uq_tenant_memberships_tenant_user"),
         Index("ix_tenant_memberships_tenant_id", "tenant_id"),
         Index("ix_tenant_memberships_user_id", "user_id"),
+        # MED-003: staff-roster listing filters by role and/or status within
+        # a tenant (see app.repositories.membership.list_by_tenant) - these
+        # composite indexes keep that scoped, filtered, paginated query
+        # efficient as a clinic's staff roster grows.
+        Index("ix_tenant_memberships_tenant_id_role", "tenant_id", "role"),
+        Index("ix_tenant_memberships_tenant_id_status", "tenant_id", "status"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)

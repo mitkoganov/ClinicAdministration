@@ -36,6 +36,15 @@ class ForbiddenError(AppError):
         super().__init__(message, status_code=403)
 
 
+class ConflictError(AppError):
+    """The request is well-formed and the caller is authorized, but the
+    action would violate a business invariant (e.g. a duplicate membership,
+    or removing the clinic's last active owner)."""
+
+    def __init__(self, message: str = "Conflict") -> None:
+        super().__init__(message, status_code=409)
+
+
 def register_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(AppError)
     async def handle_app_error(_: Request, exc: AppError) -> JSONResponse:
