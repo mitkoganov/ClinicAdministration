@@ -510,6 +510,41 @@ def test_invitation_accept_creates_session_for_the_invited_tenant_and_role(
     assert me_response.status_code == 200
 
 
+def test_invitation_accept_rejects_an_existing_inactive_account(client, auth_tenancy, db_session):
+    """MED-004 repair (finding 1): an invitation must never be a side
+    channel for reactivating a disabled account or issuing it a session -
+    accepting an invitation whose invitee_email matches an existing
+    inactive UserAccount must fail exactly like an invalid/expired token,
+    with no session cookie set."""
+    from app.models.membership import MembershipRole
+    from app.services.invitation_service import InvitationService
+
+    settings = Settings(environment="development", session_cookie_secure=False)
+    raw_token = InvitationService(db_session, settings).create_invitation(
+        auth_tenancy.tenant_b.id,
+        MembershipRole.OPERATOR,
+        auth_tenancy.inactive_account_user.normalized_email,
+        auth_tenancy.owner_user.id,
+    )
+
+    response = client.post(
+        "/api/v1/auth/invitations/accept",
+        json={
+            "token": raw_token,
+            "display_name": "Should Not Be Reactivated",
+            "password": "a brand new invitee passphrase!",
+        },
+    )
+
+    assert response.status_code == 400
+    assert SESSION_COOKIE_NAME not in client.cookies
+    assert "csrf_token" not in client.cookies
+    # The response must be indistinguishable from any other rejected
+    # invitation token - it must not mention accounts or status at all.
+    assert "inactive" not in response.json()["detail"].lower()
+    assert "account" not in response.json()["detail"].lower()
+
+
 def test_invitation_accept_rejects_extra_fields_attempting_to_override_tenant_or_role(client):
     response = client.post(
         "/api/v1/auth/invitations/accept",

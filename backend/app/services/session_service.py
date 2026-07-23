@@ -58,7 +58,16 @@ class SessionService:
         an existing session. Called fresh on every successful login,
         which is what prevents session fixation: an attacker who
         pre-plants a token in a victim's browser before login gains
-        nothing, because login never adopts a caller-supplied token."""
+        nothing, because login never adopts a caller-supplied token.
+
+        Refuses to issue a session for a non-active account, regardless of
+        caller. `AuthService.login` already screens this out earlier (with
+        a login-specific generic error), but every session-issuing path -
+        including invitation acceptance - must be safe to call on its own
+        without a session ever escaping for an account that session
+        validation would immediately reject anyway."""
+        if user.status != UserAccountStatus.ACTIVE:
+            raise UnauthorizedError()
         raw_token = generate_token()
         raw_csrf_token = generate_token()
         now = datetime.now(UTC)

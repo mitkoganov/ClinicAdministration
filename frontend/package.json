@@ -8,7 +8,8 @@
     "start": "next start",
     "lint": "eslint",
     "typecheck": "tsc --noEmit",
-    "check:clinic-selection": "node scripts/check-clinic-selection.ts"
+    "check:clinic-selection": "node scripts/check-clinic-selection.ts",
+    "check:dev-identity-policy": "node scripts/check-dev-identity-policy.ts"
   },
   "dependencies": {
     "next": "16.2.10",

@@ -1,7 +1,12 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { clearDevIdentity, readDevIdentity, writeDevIdentity } from "../lib/api";
+import {
+  clearDevIdentity,
+  isDevelopmentIdentityAvailable,
+  readDevIdentity,
+  writeDevIdentity,
+} from "../lib/api";
 
 /** Development-only identity picker: the backend's real identity provider
  * is disabled by default and only ever enabled in a `development`
@@ -30,7 +35,7 @@ export function IdentityBanner() {
     });
   }, []);
 
-  if (process.env.NODE_ENV === "production") {
+  if (!isDevelopmentIdentityAvailable()) {
     return null;
   }
 

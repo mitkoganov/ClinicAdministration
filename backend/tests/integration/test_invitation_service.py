@@ -10,6 +10,7 @@ from app.core.errors import InvalidTokenError
 from app.core.passwords import verify_password
 from app.core.session_tokens import hash_token
 from app.models.membership import MembershipRole, MembershipStatus
+from app.models.one_time_token import TokenPurpose
 from app.repositories.membership import MembershipRepository
 from app.repositories.one_time_token import OneTimeTokenRepository
 from app.services.invitation_service import InvitationService
@@ -191,3 +192,97 @@ def test_accept_invitation_does_not_emit_success_audit_for_a_consumed_token(
         service.accept_invitation(raw_token, "Second", "a different passphrase entirely")
 
     assert mock_emit_audit_event.call_count == 0
+
+
+def test_accept_invitation_rejects_an_existing_inactive_account(db_session, auth_tenancy):
+    """MED-004 repair (finding 1): an invitation is never a side channel
+    for implicitly reactivating a disabled account - reactivation must be
+    a separate, deliberate administrative action. This must fail exactly
+    like any other invalid/expired/consumed token (`InvalidTokenError`),
+    never a distinct error that would reveal the account's status."""
+    service = InvitationService(db_session, _settings())
+    raw_token = service.create_invitation(
+        auth_tenancy.tenant_b.id,
+        MembershipRole.OPERATOR,
+        auth_tenancy.inactive_account_user.normalized_email,
+        auth_tenancy.owner_user.id,
+    )
+
+    with pytest.raises(InvalidTokenError):
+        service.accept_invitation(raw_token, "Should Not Reactivate", "a brand new passphrase!!")
+
+
+def test_accept_invitation_for_inactive_account_leaves_token_and_membership_untouched(
+    db_session, auth_tenancy
+):
+    service = InvitationService(db_session, _settings())
+    raw_token = service.create_invitation(
+        auth_tenancy.tenant_b.id,
+        MembershipRole.OPERATOR,
+        auth_tenancy.inactive_account_user.normalized_email,
+        auth_tenancy.owner_user.id,
+    )
+
+    with pytest.raises(InvalidTokenError):
+        service.accept_invitation(raw_token, "Should Not Reactivate", "a brand new passphrase!!")
+
+    db_session.expire_all()
+    reloaded_token = OneTimeTokenRepository(db_session).get_by_token_hash(
+        hash_token(raw_token), TokenPurpose.INVITATION_ACCEPT
+    )
+    assert reloaded_token is not None
+    assert reloaded_token.consumed_at is None
+
+    membership = MembershipRepository(db_session).get_membership(
+        auth_tenancy.tenant_b.id, auth_tenancy.inactive_account_user.id
+    )
+    assert membership is None
+
+
+def test_accept_invitation_for_inactive_account_emits_only_a_rejected_audit(
+    db_session, auth_tenancy
+):
+    service = InvitationService(db_session, _settings())
+    raw_token = service.create_invitation(
+        auth_tenancy.tenant_b.id,
+        MembershipRole.OPERATOR,
+        auth_tenancy.inactive_account_user.normalized_email,
+        auth_tenancy.owner_user.id,
+    )
+
+    with (
+        patch("app.services.invitation_service.emit_audit_event") as mock_emit_audit_event,
+        pytest.raises(InvalidTokenError),
+    ):
+        service.accept_invitation(raw_token, "Should Not Reactivate", "a brand new passphrase!!")
+
+    events = [call.args[0] for call in mock_emit_audit_event.call_args_list]
+    assert len(events) == 1
+    assert events[0].event_type == "auth.invitation_accepted"
+    assert events[0].outcome == AuditOutcome.REJECTED
+    assert events[0].actor_user_id == auth_tenancy.inactive_account_user.id
+    # The raw token must never appear anywhere in the audit payload.
+    assert raw_token not in events[0].to_dict().values()
+
+
+def test_accept_invitation_still_works_for_an_active_account(db_session, auth_tenancy):
+    """Regression guard: the new inactive-account rejection in
+    `accept_invitation` must not affect the ordinary active-account path -
+    an existing *active* account accepting a fresh invitation must still
+    succeed exactly as before."""
+    service = InvitationService(db_session, _settings())
+    raw_token = service.create_invitation(
+        auth_tenancy.tenant_b.id,
+        MembershipRole.OPERATOR,
+        auth_tenancy.owner_user.normalized_email,
+        auth_tenancy.owner_user.id,
+    )
+
+    user = service.accept_invitation(raw_token, "Still Active", "a brand new passphrase!!")
+
+    assert user.id == auth_tenancy.owner_user.id
+    membership = MembershipRepository(db_session).get_membership(
+        auth_tenancy.tenant_b.id, auth_tenancy.owner_user.id
+    )
+    assert membership is not None
+    assert membership.status == MembershipStatus.ACTIVE

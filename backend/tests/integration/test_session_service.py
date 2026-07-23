@@ -10,6 +10,7 @@ from app.core.config import Settings
 from app.core.errors import NotFoundError, UnauthorizedError
 from app.models.membership import MembershipRole
 from app.models.tenant import Tenant, TenantStatus
+from app.models.user_account import UserAccountStatus
 from app.repositories.auth_session import AuthSessionRepository
 from app.repositories.membership import MembershipRepository
 from app.services.session_service import TOUCH_THRESHOLD, SessionService
@@ -21,6 +22,28 @@ pytestmark = pytest.mark.integration
 
 def _settings() -> Settings:
     return Settings(environment="development")
+
+
+def test_create_session_rejects_inactive_account(db_session, auth_tenancy):
+    """MED-004 repair (finding 1): every session-issuing path - not just
+    login - must refuse to mint a session for a non-active account. This
+    is the lowest common place that guards `AuthService.login` (which
+    already screens inactive accounts out earlier) and
+    `InvitationService.accept_invitation` (which must never reach this
+    call at all for an existing inactive account, but is still protected
+    here in depth)."""
+    service = SessionService(db_session, _settings())
+
+    with pytest.raises(UnauthorizedError):
+        service.create_session(auth_tenancy.inactive_account_user)
+
+    persisted = (
+        db_session.execute(
+            text("SELECT count(*) FROM auth_sessions WHERE user_id = :user_id"),
+            {"user_id": str(auth_tenancy.inactive_account_user.id)},
+        )
+    ).scalar_one()
+    assert persisted == 0
 
 
 def test_create_session_generates_unique_token_pairs(db_session, auth_tenancy):
@@ -78,9 +101,21 @@ def test_validate_session_rejects_idle_expired_session(db_session, auth_tenancy)
         service.validate_session(created.raw_token)
 
 
-def test_validate_session_rejects_inactive_account(db_session, auth_tenancy):
+def test_validate_session_rejects_an_account_deactivated_after_session_creation(
+    db_session, auth_tenancy
+):
+    """`create_session` now refuses an already-inactive account outright
+    (see test_create_session_rejects_inactive_account below), so this
+    exercises the more realistic lifecycle case instead: a session created
+    while the account was active must stop working immediately once the
+    account is deactivated afterward - validate_session re-checks status
+    on every call, it never trusts how old or "already validated" a
+    session is."""
     service = SessionService(db_session, _settings())
-    created = service.create_session(auth_tenancy.inactive_account_user)
+    created = service.create_session(auth_tenancy.owner_user)
+
+    auth_tenancy.owner_user.status = UserAccountStatus.INACTIVE
+    db_session.flush()
 
     with pytest.raises(UnauthorizedError):
         service.validate_session(created.raw_token)

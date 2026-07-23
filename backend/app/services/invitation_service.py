@@ -20,7 +20,7 @@ from app.core.passwords import InvalidPasswordError, hash_password
 from app.core.session_tokens import generate_token, hash_token
 from app.models.membership import MembershipRole, MembershipStatus, TenantMembership
 from app.models.one_time_token import OneTimeToken, TokenPurpose
-from app.models.user_account import UserAccount, normalize_email
+from app.models.user_account import UserAccount, UserAccountStatus, normalize_email
 from app.repositories.membership import MembershipRepository
 from app.repositories.one_time_token import OneTimeTokenRepository
 from app.repositories.user_account import UserAccountRepository
@@ -82,6 +82,20 @@ class InvitationService:
         user = self._users.get_by_normalized_email(token.invitee_email)
         if user is None:
             user = self._users.create(token.invitee_email, display_name, password_hash)
+        elif user.status != UserAccountStatus.ACTIVE:
+            # Deliberate reject policy, not implicit reactivation: an
+            # invitation must never be a side channel for reviving a
+            # disabled account - that is a separate, deliberate
+            # administrative action. Raising before any repository write
+            # here means the token is never consumed and the existing
+            # membership/account rows are never touched - the whole
+            # attempt leaves no trace but a rejected audit event. Reuses
+            # InvalidTokenError (not UnauthorizedError) so the response is
+            # byte-identical to every other invitation-rejection reason -
+            # it never reveals that an account exists and is specifically
+            # inactive.
+            self._audit_invitation_rejected(user, token)
+            raise InvalidTokenError()
         else:
             self._users.update_password_hash(user, password_hash, now)
 
@@ -114,6 +128,18 @@ class InvitationService:
                 outcome=AuditOutcome.SUCCESS,
                 tenant_id=token.tenant_id,
                 target_resource_id=membership.id if membership is not None else None,
+            )
+        )
+
+    @staticmethod
+    def _audit_invitation_rejected(user: UserAccount, token: OneTimeToken) -> None:
+        emit_audit_event(
+            AuditEvent(
+                event_type="auth.invitation_accepted",
+                actor_user_id=user.id,
+                target_resource_type="membership",
+                outcome=AuditOutcome.REJECTED,
+                tenant_id=token.tenant_id,
             )
         )
 

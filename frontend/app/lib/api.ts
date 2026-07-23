@@ -43,6 +43,45 @@ export function clearDevIdentity(): void {
   window.localStorage.removeItem(DEV_TENANT_ID_KEY);
 }
 
+// Single centralized place for every "is the development-identity path
+// available/active, and where should an unauthenticated caller go"
+// decision - every other file (session-status.tsx, login/page.tsx, the
+// /dev/identity route) calls into these instead of re-deriving
+// NODE_ENV/localStorage/redirect logic itself. Splitting this into two
+// atomic checks (build-time availability vs. whether one has actually
+// been configured) is what lets a clean browser be routed to the
+// dev-identity *entry point* instead of either being stuck on /login
+// (there is no session-based fallback in development) or silently doing
+// nothing (a configured-only check would never fire for a first-time
+// visitor). The actual decision table lives in the dependency-free
+// app/lib/dev-identity-policy.ts (see its focused executable check) -
+// this file only supplies that pure function with the real
+// process.env/localStorage inputs.
+
+export { DEV_IDENTITY_ENTRY_PATH } from "./dev-identity-policy";
+import { resolveUnauthenticatedDestination } from "./dev-identity-policy";
+
+/** Build-time-only: whether the retained development-identity mechanism
+ * exists in this build at all, independent of whether anyone has
+ * configured one yet. Mirrors the backend's own
+ * `ENVIRONMENT=development` half of `DEVELOPMENT_IDENTITY_ENABLED`'s
+ * startup gate (see app.core.config.Settings) - deliberately NOT
+ * derived from localStorage, which is client-controlled and must never
+ * be the thing that decides whether this mechanism exists. */
+export function isDevelopmentIdentityAvailable(): boolean {
+  return process.env.NODE_ENV !== "production";
+}
+
+/** Whether a caller has actually configured a dev identity via the
+ * banner/entry-point selector (see identity-banner.tsx). Says nothing
+ * about whether the mechanism is even available in this build - always
+ * combine with `isDevelopmentIdentityAvailable()` before treating this
+ * as meaningful, since a value that somehow survived into a production
+ * bundle must never be honored on its own (see `isDevIdentityModeActive`). */
+export function hasConfiguredDevIdentity(): boolean {
+  return readDevIdentity() !== null;
+}
+
 /** Whether the retained development-identity path should be treated as
  * active for frontend *routing* decisions (e.g. "should a 401 from
  * `/auth/me` redirect to `/login`?"). Deliberately requires BOTH a
@@ -57,7 +96,26 @@ export function clearDevIdentity(): void {
  * dev header against the database regardless of what the frontend
  * believes about "dev mode". */
 export function isDevIdentityModeActive(): boolean {
-  return process.env.NODE_ENV !== "production" && readDevIdentity() !== null;
+  return isDevelopmentIdentityAvailable() && hasConfiguredDevIdentity();
+}
+
+/** Where an unauthenticated (401 from `/auth/me`) caller should go, or
+ * `null` if they should stay put because the dev-identity path can
+ * already serve them. The single decision point behind every
+ * `/settings/*` page's unauthenticated handling:
+ * - production build → `/login` (no dev path exists at all);
+ * - development build, no dev identity configured yet → the dev-identity
+ *   entry point, NOT `/login` - a clean browser must be able to reach the
+ *   selector without first needing a production session it can never
+ *   have in this mode;
+ * - development build, dev identity already configured → `null` - the
+ *   caller's `apiFetch` calls already attach those headers regardless of
+ *   this component ever mounting, so there is nothing to redirect to. */
+export function getUnauthenticatedDestination(): string | null {
+  return resolveUnauthenticatedDestination({
+    developmentIdentityAvailable: isDevelopmentIdentityAvailable(),
+    configuredDevIdentity: hasConfiguredDevIdentity(),
+  });
 }
 
 function readCookie(name: string): string | null {

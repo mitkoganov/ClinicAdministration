@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useState } from "react";
 import { useRouter } from "next/navigation";
-import { apiFetch, errorMessage } from "../lib/api";
+import { apiFetch, errorMessage, isDevelopmentIdentityAvailable } from "../lib/api";
 
 export default function LoginPage() {
   const router = useRouter();
@@ -73,6 +73,16 @@ export default function LoginPage() {
       <p style={{ marginTop: "1rem" }}>
         <Link href="/forgot-password">Forgot your password?</Link>
       </p>
+      {isDevelopmentIdentityAvailable() && (
+        // Build-time gated only - never activated by localStorage alone,
+        // and never rendered in a production build (see
+        // isDevelopmentIdentityAvailable in app/lib/api.ts). Following
+        // this link does not itself send any dev headers; it only opens
+        // the selector where a caller can choose one.
+        <p style={{ marginTop: "0.5rem", fontSize: "0.85rem", opacity: 0.75 }}>
+          <Link href="/dev/identity">Use development identity</Link>
+        </p>
+      )}
     </main>
   );
 }
