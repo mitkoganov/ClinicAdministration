@@ -98,7 +98,9 @@ $authTestCoverageHints = @(
     "tests/integration/conftest.py",
     "tests/integration/test_password_reset_service.py",
     "tests/integration/test_session_service.py",
-    "tests/integration/test_invitation_service.py"
+    "tests/integration/test_invitation_service.py",
+    "tests/integration/test_auth_service.py",
+    "tests/conftest.py"
 )
 
 # Top-level directories whose untracked/changed files are always candidates
