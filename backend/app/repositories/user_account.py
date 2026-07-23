@@ -31,8 +31,25 @@ class UserAccountRepository:
     def update_password_hash(
         self, user: UserAccount, password_hash: str, changed_at: datetime
     ) -> None:
+        """For a REAL credential change only - authenticated change-
+        password or password-reset confirmation. Advances
+        `password_changed_at`, which callers may use for password-age
+        policy or audit interpretation. Never call this for a transparent
+        rehash (see `rehash_password_hash`) - that is not a credential
+        change and must not reset password-age tracking."""
         user.password_hash = password_hash
         user.password_changed_at = changed_at
+        self._db.flush()
+
+    def rehash_password_hash(self, user: UserAccount, password_hash: str) -> None:
+        """Replaces only the stored hash bytes - used when `needs_rehash`
+        determines the existing hash was produced with outdated Argon2
+        parameters, discovered incidentally during an otherwise-successful
+        login. The user did not change their password, so
+        `password_changed_at` must stay exactly as it was; this is
+        maintenance of the hash's cost parameters, not a credential
+        change."""
+        user.password_hash = password_hash
         self._db.flush()
 
     def record_successful_login(self, user: UserAccount, at: datetime) -> None:

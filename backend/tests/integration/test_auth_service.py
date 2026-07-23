@@ -1,12 +1,14 @@
 import uuid
+from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
 import pytest
+from argon2 import PasswordHasher
 
 from app.core.audit import AuditOutcome
 from app.core.config import Settings
 from app.core.errors import UnauthorizedError, WeakPasswordError
-from app.core.passwords import verify_password
+from app.core.passwords import needs_rehash, verify_password
 from app.core.rate_limit import RateLimiter
 from app.services.auth_service import AuthService
 
@@ -192,6 +194,127 @@ def test_change_password_revokes_other_sessions(db_session, auth_tenancy):
         service._sessions.validate_session(session_2.raw_token)
     # session_1 (the one used to authorize the change) stays valid.
     service._sessions.validate_session(session_1.raw_token)
+
+
+# --- Codex repair (MEDIUM): a transparent password rehash on login is
+# maintenance (stronger Argon2 parameters discovered incidentally during
+# verification), not a credential change - it must update only the
+# stored hash, never password_changed_at, and must never be confused with
+# a real password-changed event. -----------------------------------------
+
+
+def _weaken_password_hash(db_session, user, raw_password: str, changed_at: datetime) -> str:
+    """Installs a hash produced with deliberately weaker-than-default
+    Argon2 parameters so `needs_rehash()` is genuinely True - not mocked,
+    the real repository/service rehash path runs end to end. Commits
+    (not just flushes) so this setup survives a later test that injects
+    a commit failure into the SAME db_session - a rollback there must
+    only undo what happened after this point, not this setup itself."""
+    weak_hash = PasswordHasher(time_cost=1, memory_cost=8, parallelism=1).hash(raw_password)
+    assert needs_rehash(weak_hash) is True
+    user.password_hash = weak_hash
+    user.password_changed_at = changed_at
+    db_session.commit()
+    return weak_hash
+
+
+def test_login_rehash_updates_hash_but_preserves_password_changed_at(db_session, auth_tenancy):
+    original_changed_at = datetime.now(UTC) - timedelta(days=30)
+    weak_hash = _weaken_password_hash(
+        db_session, auth_tenancy.owner_user, auth_tenancy.owner_password, original_changed_at
+    )
+
+    service = _service(db_session)
+    service.login(auth_tenancy.owner_user.normalized_email, auth_tenancy.owner_password, None)
+
+    db_session.refresh(auth_tenancy.owner_user)
+    assert auth_tenancy.owner_user.password_hash != weak_hash
+    assert verify_password(auth_tenancy.owner_password, auth_tenancy.owner_user.password_hash)
+    assert (
+        abs((auth_tenancy.owner_user.password_changed_at - original_changed_at).total_seconds()) < 1
+    )
+
+
+def test_login_rehash_does_not_emit_a_password_changed_audit(db_session, auth_tenancy):
+    _weaken_password_hash(
+        db_session,
+        auth_tenancy.owner_user,
+        auth_tenancy.owner_password,
+        datetime.now(UTC) - timedelta(days=30),
+    )
+
+    service = _service(db_session)
+    with patch("app.services.auth_service.emit_audit_event") as mock_emit_audit_event:
+        service.login(auth_tenancy.owner_user.normalized_email, auth_tenancy.owner_password, None)
+
+    event_types = [call.args[0].event_type for call in mock_emit_audit_event.call_args_list]
+    assert event_types == ["auth.login_success"]
+
+
+def test_login_rehash_does_not_revoke_other_sessions(db_session, auth_tenancy):
+    service = _service(db_session)
+    other_session = service.login(
+        auth_tenancy.owner_user.normalized_email, auth_tenancy.owner_password, None
+    )
+    _weaken_password_hash(
+        db_session,
+        auth_tenancy.owner_user,
+        auth_tenancy.owner_password,
+        datetime.now(UTC) - timedelta(days=30),
+    )
+
+    service.login(auth_tenancy.owner_user.normalized_email, auth_tenancy.owner_password, None)
+
+    # A rehash is not a credential change - unlike change_password, it
+    # must never revoke any other outstanding session.
+    service._sessions.validate_session(other_session.raw_token)
+
+
+def test_login_rehash_rolls_back_everything_when_commit_fails(db_session, auth_tenancy):
+    original_changed_at = datetime.now(UTC) - timedelta(days=30)
+    weak_hash = _weaken_password_hash(
+        db_session, auth_tenancy.owner_user, auth_tenancy.owner_password, original_changed_at
+    )
+
+    service = _service(db_session)
+    with (
+        patch.object(db_session, "commit", side_effect=RuntimeError("simulated commit failure")),
+        patch("app.services.auth_service.emit_audit_event") as mock_emit_audit_event,
+        pytest.raises(RuntimeError, match="simulated commit failure"),
+    ):
+        service.login(auth_tenancy.owner_user.normalized_email, auth_tenancy.owner_password, None)
+
+    assert mock_emit_audit_event.call_count == 0
+    db_session.expire_all()
+    assert auth_tenancy.owner_user.password_hash == weak_hash
+    assert (
+        abs((auth_tenancy.owner_user.password_changed_at - original_changed_at).total_seconds()) < 1
+    )
+
+    # The failure was transient - a retry with the same (still-weak, still
+    # verifiable) hash must be able to complete a real rehash afterward.
+    service.login(auth_tenancy.owner_user.normalized_email, auth_tenancy.owner_password, None)
+    db_session.refresh(auth_tenancy.owner_user)
+    assert auth_tenancy.owner_user.password_hash != weak_hash
+
+
+def test_change_password_still_updates_password_changed_at(db_session, auth_tenancy):
+    """Regression: the rehash-specific fix must not have weakened the
+    REAL credential-change path - change_password still advances
+    password_changed_at exactly as before."""
+    service = _service(db_session)
+    created = service.login(
+        auth_tenancy.owner_user.normalized_email, auth_tenancy.owner_password, None
+    )
+    before = auth_tenancy.owner_user.password_changed_at
+
+    service.change_password(
+        auth_tenancy.owner_user, created.session, auth_tenancy.owner_password, "a brand new one!!"
+    )
+
+    db_session.refresh(auth_tenancy.owner_user)
+    assert auth_tenancy.owner_user.password_changed_at is not None
+    assert auth_tenancy.owner_user.password_changed_at != before
 
 
 def test_logout_revokes_the_session(db_session, auth_tenancy):

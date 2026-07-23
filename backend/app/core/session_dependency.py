@@ -47,27 +47,35 @@ def get_current_session_optional(
     the combined session/dev-identity tenant-context resolution.
 
     "Optional" only ever means "no session cookie was sent" - it must
-    never also mean "a session cookie was sent but turned out invalid".
-    `InvalidSessionError` (a subclass of `UnauthorizedError`, raised by
-    `validate_session` for every unknown/revoked/expired/inactive-account
-    case) is deliberately re-raised, not swallowed, so a stale cookie
-    still reaches the dedicated cookie-clearing exception handler (see
-    app.core.session_cookies) and still blocks the dev-identity fallback
-    in `get_tenant_context` - an attacker-controlled or merely-stale
-    production cookie must never be treated as if it were absent. Only
-    the narrower, non-session-specific `UnauthorizedError` that
-    `validate_session` raises for a touch-commit failure (a transient
-    infrastructure problem, not a statement about the cookie's validity)
-    is still treated as "no session" here."""
+    never also mean "a session cookie was sent but turned out invalid"
+    OR "a session cookie was sent and validating it hit a transient
+    infrastructure problem". Both `InvalidSessionError` (unknown/revoked/
+    expired/inactive-account - a subclass of `UnauthorizedError`) and the
+    plainer `UnauthorizedError` `validate_session` raises for a
+    touch-commit failure must propagate unchanged, never collapse to
+    `None` here:
+
+    - A stale `InvalidSessionError` collapsing to `None` would make
+      `get_tenant_context`'s dev-identity fallback treat an
+      attacker-controlled or merely-stale production cookie as if it
+      were absent, and would skip the dedicated cookie-clearing handler
+      (see app.core.session_cookies).
+    - A transient `UnauthorizedError` collapsing to `None` is worse: this
+      dependency backs `require_csrf` (see app.core.csrf), and `None`
+      there means "CSRF does not apply" - so a mutating request whose
+      session touch-refresh commit merely hiccuped would skip CSRF
+      enforcement entirely, even though the same request's OTHER auth
+      dependency (`get_current_session`) might independently re-validate
+      and succeed moments later. A caught-but-genuinely-transient error
+      must fail the request, not silently downgrade its auth to `None`.
+
+    This function therefore never catches anything from
+    `validate_session` - only a genuinely missing cookie short-circuits
+    to `None`."""
     raw_token = _extract_session_token(request)
     if not raw_token:
         return None
-    try:
-        return SessionService(db, settings).validate_session(raw_token)
-    except InvalidSessionError:
-        raise
-    except UnauthorizedError:
-        return None
+    return SessionService(db, settings).validate_session(raw_token)
 
 
 def get_current_session_or_none_if_stale(

@@ -62,7 +62,13 @@ class AuthService:
             raise UnauthorizedError("Invalid email or password.")
 
         if needs_rehash(user.password_hash):
-            self._users.update_password_hash(user, hash_password(password), datetime.now(UTC))
+            # A transparent rehash (stronger Argon2 parameters, discovered
+            # incidentally during this successful verification) is
+            # maintenance, not a credential change - the user did not
+            # change their password, so password_changed_at (and any
+            # policy/audit reading it) must stay exactly as it was. See
+            # UserAccountRepository.rehash_password_hash.
+            self._users.rehash_password_hash(user, hash_password(password))
 
         if self._rate_limiter is not None:
             for key in login_rate_limit_keys(normalized, client_ip):
@@ -70,7 +76,17 @@ class AuthService:
 
         created = self._sessions.create_session(user)
         self._users.record_successful_login(user, datetime.now(UTC))
-        self._db.commit()
+        try:
+            self._db.commit()
+        except Exception:
+            # A commit failure here must roll back everything flushed
+            # above - the new session, the last-login timestamp, and any
+            # transparent rehash - not leave a half-applied state (e.g. a
+            # rehashed password_hash with no corresponding session) or a
+            # false success audit for a login that never actually
+            # completed.
+            self._db.rollback()
+            raise
         self._audit(user, "auth.login_success", AuditOutcome.SUCCESS)
         return created
 

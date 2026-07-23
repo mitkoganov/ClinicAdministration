@@ -130,6 +130,20 @@ def test_confirm_reset_updates_password(db_session, auth_tenancy):
     assert verify_password(new_password, auth_tenancy.owner_user.password_hash)
 
 
+def test_confirm_reset_updates_password_changed_at(db_session, auth_tenancy):
+    """A password reset is a real credential change - unlike a
+    transparent login rehash, it must advance password_changed_at."""
+    before = auth_tenancy.owner_user.password_changed_at
+    service = PasswordResetService(db_session, _settings())
+    raw_token = service.request_reset(auth_tenancy.owner_user.normalized_email)
+
+    service.confirm_reset(raw_token, "a brand new reset passphrase!!")
+
+    db_session.refresh(auth_tenancy.owner_user)
+    assert auth_tenancy.owner_user.password_changed_at is not None
+    assert auth_tenancy.owner_user.password_changed_at != before
+
+
 def test_confirm_reset_revokes_existing_sessions(db_session, auth_tenancy):
     session_service = SessionService(db_session, _settings())
     created = session_service.create_session(auth_tenancy.owner_user)
