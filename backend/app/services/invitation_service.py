@@ -13,11 +13,12 @@ from datetime import UTC, datetime, timedelta
 
 from sqlalchemy.orm import Session
 
+from app.core.audit import AuditEvent, AuditOutcome, emit_audit_event
 from app.core.config import Settings
 from app.core.errors import InvalidTokenError, WeakPasswordError
 from app.core.passwords import InvalidPasswordError, hash_password
 from app.core.session_tokens import generate_token, hash_token
-from app.models.membership import MembershipRole, MembershipStatus
+from app.models.membership import MembershipRole, MembershipStatus, TenantMembership
 from app.models.one_time_token import OneTimeToken, TokenPurpose
 from app.models.user_account import UserAccount, normalize_email
 from app.repositories.membership import MembershipRepository
@@ -85,10 +86,11 @@ class InvitationService:
             self._users.update_password_hash(user, password_hash, now)
 
         existing_membership = self._memberships.get_membership(token.tenant_id, user.id)
+        membership: TenantMembership | None
         if existing_membership is None:
-            self._memberships.create(token.tenant_id, user.id, token.invited_role)
+            membership = self._memberships.create(token.tenant_id, user.id, token.invited_role)
         else:
-            self._memberships.update(
+            membership = self._memberships.update(
                 token.tenant_id,
                 existing_membership.id,
                 role=token.invited_role,
@@ -97,7 +99,23 @@ class InvitationService:
 
         self._tokens.consume(token, now)
         self._db.commit()
+        self._audit_invitation_accepted(user, token, membership)
         return user
+
+    @staticmethod
+    def _audit_invitation_accepted(
+        user: UserAccount, token: OneTimeToken, membership: TenantMembership | None
+    ) -> None:
+        emit_audit_event(
+            AuditEvent(
+                event_type="auth.invitation_accepted",
+                actor_user_id=user.id,
+                target_resource_type="membership",
+                outcome=AuditOutcome.SUCCESS,
+                tenant_id=token.tenant_id,
+                target_resource_id=membership.id if membership is not None else None,
+            )
+        )
 
     @staticmethod
     def _is_usable(token: OneTimeToken | None, now: datetime) -> bool:

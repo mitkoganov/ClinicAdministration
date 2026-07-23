@@ -49,7 +49,9 @@ function AcceptInvitationForm() {
         method: "POST",
         body: JSON.stringify({ token, display_name: displayName, password }),
       });
-      router.push("/settings/clinic");
+      // Same reasoning as frontend/app/login/page.tsx: the new session
+      // this call creates starts with no clinic selected server-side.
+      router.push("/select-clinic");
     } catch (err: unknown) {
       setError(errorMessage(err));
     } finally {

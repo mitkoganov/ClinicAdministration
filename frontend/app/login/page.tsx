@@ -21,7 +21,12 @@ export default function LoginPage() {
         method: "POST",
         body: JSON.stringify({ email, password }),
       });
-      router.push("/settings/clinic");
+      // A brand-new session always starts with no clinic selected
+      // server-side - /select-clinic is the single place that resolves
+      // "how many active clinics does this account have" into either an
+      // automatic selection, a chooser, or a no-clinics state, so this
+      // page never guesses which of those applies.
+      router.push("/select-clinic");
     } catch (err: unknown) {
       // The backend already returns a single generic message for every
       // failure shape (wrong password, unknown account, inactive

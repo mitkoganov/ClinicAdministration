@@ -43,6 +43,23 @@ export function clearDevIdentity(): void {
   window.localStorage.removeItem(DEV_TENANT_ID_KEY);
 }
 
+/** Whether the retained development-identity path should be treated as
+ * active for frontend *routing* decisions (e.g. "should a 401 from
+ * `/auth/me` redirect to `/login`?"). Deliberately requires BOTH a
+ * build-time development environment AND an explicitly configured
+ * identity - never localStorage alone - mirroring the backend's own
+ * `DEVELOPMENT_IDENTITY_ENABLED` + `ENVIRONMENT=development` gate (see
+ * app.core.config.Settings). A localStorage value surviving into a
+ * production build is never enough by itself: `IdentityBanner` already
+ * never renders (and thus never writes one) in a production build, and
+ * this check independently refuses to honor one anyway. This never
+ * grants access on its own - the backend independently re-validates any
+ * dev header against the database regardless of what the frontend
+ * believes about "dev mode". */
+export function isDevIdentityModeActive(): boolean {
+  return process.env.NODE_ENV !== "production" && readDevIdentity() !== null;
+}
+
 function readCookie(name: string): string | null {
   if (typeof document === "undefined") {
     return null;

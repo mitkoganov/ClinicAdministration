@@ -14,6 +14,7 @@ from datetime import UTC, datetime, timedelta
 
 from sqlalchemy.orm import Session
 
+from app.core.audit import AuditEvent, AuditOutcome, emit_audit_event
 from app.core.config import Settings
 from app.core.errors import NotFoundError, UnauthorizedError
 from app.core.session_tokens import generate_token, hash_token
@@ -90,6 +91,20 @@ class SessionService:
             self._sessions.touch(
                 session, now, now + timedelta(hours=self._settings.session_idle_lifetime_hours)
             )
+            # The idle-refresh write must actually reach the database - a
+            # bare flush is only visible within this request's own
+            # transaction and is discarded (never committed) once the
+            # request's DB session closes, silently undoing the idle
+            # extension for every subsequent request. Only commit when a
+            # touch was actually due, so a plain read request that doesn't
+            # need refreshing never pays for an extra round trip. A commit
+            # failure here must not silently pretend the session is still
+            # valid with a stale expiry - fail closed instead.
+            try:
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise UnauthorizedError() from None
 
         return ValidatedSession(session=session, user=user)
 
@@ -118,9 +133,30 @@ class SessionService:
         prevention convention."""
         tenant = TenantRepository(self._db).get_by_id(tenant_id)
         if tenant is None or tenant.status != TenantStatus.ACTIVE:
+            self._audit_clinic_selection(session, user_id, tenant_id, AuditOutcome.REJECTED)
             raise NotFoundError()
         membership = MembershipRepository(self._db).get_membership(tenant_id, user_id)
         if membership is None or membership.status != MembershipStatus.ACTIVE:
+            self._audit_clinic_selection(session, user_id, tenant_id, AuditOutcome.REJECTED)
             raise NotFoundError()
         self._sessions.select_tenant(session, tenant_id)
         self._db.commit()
+        self._audit_clinic_selection(session, user_id, tenant_id, AuditOutcome.SUCCESS)
+
+    def _audit_clinic_selection(
+        self,
+        session: AuthSession,
+        user_id: uuid.UUID,
+        tenant_id: uuid.UUID,
+        outcome: AuditOutcome,
+    ) -> None:
+        emit_audit_event(
+            AuditEvent(
+                event_type="auth.clinic_selected",
+                actor_user_id=user_id,
+                target_resource_type="auth_session",
+                outcome=outcome,
+                tenant_id=tenant_id,
+                target_resource_id=session.id,
+            )
+        )

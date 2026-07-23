@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { ApiError, apiFetch, errorMessage } from "../lib/api";
+import { ApiError, apiFetch, errorMessage, isDevIdentityModeActive } from "../lib/api";
 
 type MeResponse = {
   email: string;
@@ -13,13 +13,23 @@ type MeResponse = {
 type State =
   | { kind: "loading" }
   | { kind: "unauthenticated" }
+  // A 401 from /auth/me while the explicit, build-time-gated development
+  // identity path is active (see app/lib/api.ts's isDevIdentityModeActive)
+  // is expected, not an error: settings pages still work via dev headers
+  // attached by apiFetch, independent of a production session. Forcing a
+  // /login redirect here would break that retained local-testing path -
+  // see ARCHITECTURE.md "Dev-identity isolation" and SECURITY.md
+  // "Development identity restrictions".
+  | { kind: "dev-identity" }
   | { kind: "error"; message: string }
   | { kind: "loaded"; me: MeResponse };
 
 /** Shows the current logged-in user (if any) and a logout button at the
- * top of every /settings/* page. Redirects to /login when there is no
- * valid session - the settings pages themselves never render their own
- * "please log in" state, this is the one shared place for it. */
+ * top of every /settings/* page. This is the single centralized place
+ * that decides, for every settings page, whether the caller needs to be
+ * sent to /login (no session and no dev identity), to /select-clinic (a
+ * valid session with no clinic selected yet), or can proceed - individual
+ * settings pages never re-implement any of these redirects themselves. */
 export function SessionStatus() {
   const router = useRouter();
   const [state, setState] = useState<State>({ kind: "loading" });
@@ -30,7 +40,7 @@ export function SessionStatus() {
         .then((me) => setState({ kind: "loaded", me }))
         .catch((error: unknown) => {
           if (error instanceof ApiError && error.status === 401) {
-            setState({ kind: "unauthenticated" });
+            setState(isDevIdentityModeActive() ? { kind: "dev-identity" } : { kind: "unauthenticated" });
             return;
           }
           setState({ kind: "error", message: errorMessage(error) });
@@ -41,8 +51,16 @@ export function SessionStatus() {
   useEffect(() => {
     if (state.kind === "unauthenticated") {
       router.replace("/login");
+      return;
     }
-  }, [state.kind, router]);
+    // A production session always takes priority server-side over dev
+    // headers (see get_tenant_context) - this only ever fires for an
+    // actual authenticated session that has not chosen a clinic yet, not
+    // for the dev-identity path above, which never reaches "loaded".
+    if (state.kind === "loaded" && state.me.selected_clinic === null) {
+      router.replace("/select-clinic");
+    }
+  }, [state, router]);
 
   async function handleLogout() {
     const csrfToken = document.cookie.match(/(?:^|;\s*)csrf_token=([^;]*)/)?.[1];
@@ -56,8 +74,20 @@ export function SessionStatus() {
   if (state.kind === "loading" || state.kind === "unauthenticated") {
     return <p>Loading session…</p>;
   }
+  if (state.kind === "dev-identity") {
+    return (
+      <p style={{ fontSize: "0.9rem", opacity: 0.8 }}>
+        Development identity active — using the X-Dev-User-Id/X-Tenant-Id headers below instead
+        of a production session.
+      </p>
+    );
+  }
   if (state.kind === "error") {
     return <p>Could not load session: {state.message}</p>;
+  }
+  if (state.me.selected_clinic === null) {
+    // Redirecting to /select-clinic - see the effect above.
+    return <p>Loading session…</p>;
   }
 
   return (
