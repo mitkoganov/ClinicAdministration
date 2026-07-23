@@ -770,21 +770,29 @@ $schemaPath       = Join-Path $root ".ai-workflow\prompts\review-output-schema.j
 # Size handling: drop lowest-priority (highest Tier number) sections first,
 # largest-first within a tier, until under budget. Never truncate a
 # section's content - only drop it whole, and record it as omitted.
-# 1,300,000 chars is a conservative budget well under typical large-context
-# model limits while leaving headroom for the prompt/schema/instructions.
-# Raised from 900,000 (MED-004 repair): on a clean tree the diff is always
-# taken against the merge-base with master (see the diff-baseline comment
-# near the top of this file), so a long-running feature branch with many
-# repair commits keeps accreting legitimate review-relevant diff content
-# round over round - splitting the one largest file (done for
-# test_auth_api.py, see $authTestCoverageHints) stops that specific file
-# from being the casualty, but does not stop the same size pressure from
-# dropping a DIFFERENT file next round. Once the budget was no longer
-# comfortably above the real size of a normal, non-bloated review packet
-# for this branch, raising it was the right call over further hint-pinning
-# individual files one at a time.
+# Lowered from 1,300,000 (MED-004 repair, this round): that value was
+# raised for legitimate reasons (see history below), but turned out to sit
+# ABOVE a hard, external ceiling this script did not previously know
+# about - Codex's own `turn/start` call rejects any input over 1,048,576
+# characters outright (`Input exceeds the maximum length of 1048576
+# characters`, observed directly in codex-review-stderr.txt), and that
+# input is the packet PLUS the ~3,800-char prompt template PLUS several
+# more thousand characters of overhead Codex's own CLI adds on top (schema
+# serialization, sandbox/system instructions - not something this script
+# controls or can measure in advance). 950,000 leaves comfortable headroom
+# below that hard ceiling even accounting for that unmeasured overhead.
+# This is a real ceiling, not a preference - it cannot be raised away; the
+# only lever left is dropping/hint-pinning individual files (see
+# $authTestCoverageHints below) exactly as already done for
+# test_auth_api.py's split.
+#
+# History: originally 900,000. Raised to 1,300,000 in an earlier MED-004
+# repair round when splitting test_auth_api.py alone wasn't enough to stop
+# a long-running branch's ever-growing merge-base diff from dropping a
+# DIFFERENT file each round - that reasoning is still correct in spirit,
+# it just picked a number above a limit nobody had hit yet.
 # ---------------------------------------------------------------------------
-$MaxPacketChars = 1300000
+$MaxPacketChars = 950000
 $sections = $packet.Sections
 
 function Get-TotalChars {
