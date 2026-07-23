@@ -303,6 +303,19 @@ function Build-ReviewPacket {
         }
     }
 
+    # Paths already embedded via a dedicated section above (currently: only
+    # governing docs) - the generic untracked/renamed/tracked-changed-file
+    # loops below must skip these entirely rather than embedding them a
+    # SECOND time. A governing doc like ARCHITECTURE.md or SECURITY.md is a
+    # root-level .md file, which Test-ReviewRelevantPath treats as generically
+    # reviewable - so whenever one of them also appears in `git diff
+    # --name-status` (normal on a long-running branch), the generic loop
+    # would otherwise add a second "Tracked changed file" section with the
+    # exact same content, wasting packet budget and confusing the reviewer
+    # with duplicate context for the same file.
+    $alreadyEmbeddedNormalizedPaths = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($c in $reviewedCandidates) { [void]$alreadyEmbeddedNormalizedPaths.Add((ConvertTo-NormalizedReviewPath $c)) }
+
     # --- Tier 1: git status / diff stat ------------------------------------------------
     Add-Section -Title "git status --short" -RelPath "(git status --short)" `
         -Content "$fence`n$statusShort`n$fence" -Tier 1
@@ -333,6 +346,9 @@ function Build-ReviewPacket {
     foreach ($rel in $untrackedList) {
         $relNorm = $rel -replace '\\', '/'
 
+        if ($alreadyEmbeddedNormalizedPaths.Contains((ConvertTo-NormalizedReviewPath $relNorm))) {
+            continue
+        }
         if (-not (Test-PathInsideRepoRoot -Root $RepoRoot -RelativePath $rel)) {
             Add-Omitted -RelPath $relNorm -Reason "outside repository root - refused"
             continue
@@ -391,6 +407,9 @@ function Build-ReviewPacket {
             $newRel = $fields[2] -replace '\\', '/'
             $kind = if ($statusCode.StartsWith("R")) { "renamed" } else { "copied" }
 
+            if ($alreadyEmbeddedNormalizedPaths.Contains((ConvertTo-NormalizedReviewPath $newRel))) {
+                continue
+            }
             if (-not (Test-PathInsideRepoRoot -Root $RepoRoot -RelativePath $fields[2])) {
                 Add-Omitted -RelPath $newRel -Reason "outside repository root - refused"
                 continue
@@ -441,6 +460,9 @@ function Build-ReviewPacket {
             continue
         }
 
+        if ($alreadyEmbeddedNormalizedPaths.Contains((ConvertTo-NormalizedReviewPath $relNorm))) {
+            continue
+        }
         if (-not (Test-PathInsideRepoRoot -Root $RepoRoot -RelativePath $rel)) {
             Add-Omitted -RelPath $relNorm -Reason "outside repository root - refused"
             continue
