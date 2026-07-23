@@ -42,14 +42,52 @@
 # -ValidateDiffCollection builds several packets against a disposable,
 # throwaway Git repository under the OS temp directory (never this
 # repository) covering staged-only/unstaged-only/mixed/added/deleted/
-# renamed/untracked/report-noise/clean-tree scenarios, and asserts the
-# packet-construction logic (the same Build-ReviewPacket function a real
-# review uses - not a re-implemented approximation) handles every one of
-# them correctly with no duplicate entries and no mutation of the
-# disposable repo's own Git index. Exits non-zero without invoking Codex
-# if any assertion fails.
+# renamed/untracked/report-noise/clean-tree/incremental-baseline scenarios,
+# and asserts the packet-construction logic (the same Build-ReviewPacket
+# function a real review uses - not a re-implemented approximation)
+# handles every one of them correctly with no duplicate entries and no
+# mutation of the disposable repo's own Git index. Exits non-zero without
+# invoking Codex if any assertion fails.
+#
+# -Incremental (with -BaselineCommit, optionally -ToCommit) reviews only
+# the commits after a chosen, already-reviewed baseline, instead of the
+# full merge-base-with-master diff every -FullBranch (default) run
+# re-embeds. Root cause this exists to fix: on a long-running repair
+# branch, that full-branch diff keeps growing every round, and pinning
+# individual files to survive the size budget just moves the omission to
+# a DIFFERENT unpinned file next round (see MED-004's repair history) -
+# the size budget itself was never the real problem, re-reviewing the
+# entire branch from scratch every round was. Incremental mode instead:
+#   - diffs from $BaselineCommit to the current tree (a single git ref,
+#     not a range, so uncommitted staged/unstaged work on top of HEAD is
+#     still included - exactly how -FullBranch's "uncommitted" mode
+#     already diffs against a single ref, just pointed at the baseline
+#     instead of HEAD);
+#   - marks EVERY file touched by that diff as Tier 1 (never droppable),
+#     not just a hand-maintained hint list - the omission this whole
+#     mode exists to prevent can no longer recur for anything actually
+#     reviewed;
+#   - adds a fixed, documented auth-context allowlist (session/CSRF/auth
+#     service/user-account files - see $authContextAllowlist below) as
+#     Tier 2 (droppable only if the packet cannot otherwise fit, never
+#     silently, since Incremental's drop threshold only removes Tier 3);
+#   - adds compact, Git-derived baseline evidence (commit list, blob
+#     hashes, prior repair commit messages) instead of re-embedding full
+#     file contents for anything already covered by the baseline;
+#   - hard-fails packet generation (never produces an incomplete packet)
+#     if the baseline is not an ancestor of the target commit, if the
+#     target commit does not match actual HEAD, or if any file the
+#     incremental diff touched is missing a Tier 0/1 section afterward.
+# -ExcludeContextManifest (default off, i.e. the manifest is included by
+# default) drops the compact Tier 2 baseline-evidence/frontend-unchanged-
+# evidence sections, keeping Tier 0/1 only, for a smaller diagnostic
+# packet.
 
-param([switch]$DryRun, [switch]$ValidateProvenance, [switch]$ValidateDiffCollection)
+param(
+    [switch]$DryRun, [switch]$ValidateProvenance, [switch]$ValidateDiffCollection,
+    [switch]$Incremental, [string]$BaselineCommit, [string]$ToCommit,
+    [switch]$ExcludeContextManifest
+)
 
 . "$PSScriptRoot\common.ps1"
 
@@ -101,6 +139,34 @@ $authTestCoverageHints = @(
     "tests/integration/test_invitation_service.py",
     "tests/integration/test_auth_service.py",
     "tests/conftest.py"
+)
+
+# Incremental mode's fixed auth context profile (see this script's header
+# comment on -Incremental): the minimum set of files Codex needs to
+# understand ANY auth/session/CSRF/password repair, regardless of whether
+# the current incremental diff happens to touch them. Embedded as Tier 2
+# context (see $authContextAllowlist below) ONLY when not already covered
+# by the current diff's own Tier 1 sections - this is deliberately a flat,
+# explicit list, not a dependency-graph walk: this task's own instructions
+# call for "minimally надеждния auth context profile", not a general
+# dependency parser. Extend this list (or add a sibling profile, e.g. a
+# tenancy or appointments context) if a future incremental review needs a
+# different fixed context set.
+$authContextAllowlist = @(
+    "backend/app/core/session_dependency.py",
+    "backend/app/services/session_service.py",
+    "backend/app/core/csrf.py",
+    "backend/app/core/errors.py",
+    "backend/app/core/session_cookies.py",
+    "backend/app/core/tenant_context.py",
+    "backend/app/services/auth_service.py",
+    "backend/app/repositories/user_account.py",
+    "backend/app/models/user_account.py",
+    "backend/app/core/passwords.py",
+    "backend/app/api/auth.py",
+    "backend/tests/integration/auth_api_helpers.py",
+    "backend/tests/integration/conftest.py",
+    "backend/tests/conftest.py"
 )
 
 # Top-level directories whose untracked/changed files are always candidates
@@ -209,7 +275,11 @@ function Build-ReviewPacket {
     #>
     param(
         [Parameter(Mandatory)][string]$RepoRoot,
-        [string[]]$ProtectedBranches = @()
+        [string[]]$ProtectedBranches = @(),
+        [switch]$Incremental,
+        [string]$BaselineCommit,
+        [string]$ToCommit,
+        [switch]$ExcludeContextManifest
     )
 
     $sections = [System.Collections.Generic.List[hashtable]]::new()
@@ -254,8 +324,50 @@ function Build-ReviewPacket {
     $mode = "uncommitted"
     $diffRangeArg = @("HEAD")
     $nothingToReviewReason = $null
+    $baselineResolved = $null
+    $toCommitResolved = $null
 
-    if ([string]::IsNullOrWhiteSpace($statusShortExcludingReports)) {
+    # --- Incremental mode: diff from an explicit, already-reviewed
+    # baseline commit to the current tree, instead of the full
+    # merge-base-with-master diff -FullBranch (default) always re-embeds.
+    # Uses a SINGLE git ref (not a range) for $diffRangeArg - exactly like
+    # the default "uncommitted" mode above uses a bare "HEAD" - so `git
+    # diff <ref>` naturally combines every commit since the baseline WITH
+    # any currently staged/unstaged working-tree changes into one diff,
+    # satisfying "uncommitted changes are still included" without a
+    # second collection pass. Every validation failure below is a hard
+    # `throw`, never a partially-built packet - an incremental review
+    # with a wrong/unverifiable baseline is worse than no review at all,
+    # since it would silently under-review the branch.
+    if ($Incremental) {
+        if ([string]::IsNullOrWhiteSpace($BaselineCommit)) {
+            throw "Incremental mode requires -BaselineCommit (a commit hash/ref that was already reviewed to completion)."
+        }
+        & git -C $RepoRoot rev-parse --verify --quiet "$BaselineCommit^{commit}" *>$null
+        if ($LASTEXITCODE -ne 0) {
+            throw "Incremental mode: -BaselineCommit '$BaselineCommit' does not resolve to a valid commit in this repository."
+        }
+        $baselineResolved = ((& git -C $RepoRoot rev-parse $BaselineCommit) | Out-String).Trim()
+        $actualHead = ((& git -C $RepoRoot rev-parse HEAD) | Out-String).Trim()
+        if ([string]::IsNullOrWhiteSpace($ToCommit)) {
+            $toCommitResolved = $actualHead
+        } else {
+            & git -C $RepoRoot rev-parse --verify --quiet "$ToCommit^{commit}" *>$null
+            if ($LASTEXITCODE -ne 0) {
+                throw "Incremental mode: -ToCommit '$ToCommit' does not resolve to a valid commit in this repository."
+            }
+            $toCommitResolved = ((& git -C $RepoRoot rev-parse $ToCommit) | Out-String).Trim()
+            if ($toCommitResolved -ne $actualHead) {
+                throw "Incremental mode: -ToCommit '$ToCommit' (resolves to $toCommitResolved) does not match the actual current HEAD ($actualHead). Refusing to review any target other than the real current HEAD - commit whatever this review should cover first."
+            }
+        }
+        & git -C $RepoRoot merge-base --is-ancestor $baselineResolved $toCommitResolved
+        if ($LASTEXITCODE -ne 0) {
+            throw "Incremental mode: baseline commit '$baselineResolved' is not an ancestor of target commit '$toCommitResolved'. A baseline must be an already-reviewed point strictly behind the review target."
+        }
+        $mode = "incremental"
+        $diffRangeArg = @($baselineResolved)
+    } elseif ([string]::IsNullOrWhiteSpace($statusShortExcludingReports)) {
         $baseBranch = $null
         foreach ($candidate in $ProtectedBranches) {
             & git -C $RepoRoot rev-parse --verify --quiet $candidate *>$null
@@ -285,6 +397,26 @@ function Build-ReviewPacket {
         }
         $diffRangeArg = @("$mergeBase..HEAD")
         $mode = "clean-committed-range"
+    }
+
+    # --- Tier 1: review-mode header - states in the packet itself (not just
+    # this script's own comments) what kind of review this is, so Codex
+    # never has to guess whether "unchanged" claims are trustworthy. ------
+    if ($mode -eq "incremental") {
+        $headerLines = @(
+            "This is an INCREMENTAL review, not a full-branch review.",
+            "",
+            "- Baseline commit (already reviewed to completion): $baselineResolved",
+            "- Target commit (current HEAD): $toCommitResolved",
+            "- Diff range collected: everything reachable from '$baselineResolved' to the current working tree (commits + any staged/unstaged changes on top)",
+            "- Tier legend for this packet:",
+            "  - Tier 1: governing docs, this header, git status/diff, every file touched by the incremental diff, quality/migration evidence, the changed-file completeness manifest - never dropped",
+            "  - Tier 2: fixed auth context files not already covered by the diff, compact Git-derived baseline evidence, frontend-unchanged evidence - dropped only if the packet cannot otherwise fit under budget",
+            "  - Tier 3: anything else - dropped first under budget pressure",
+            "- Do not request the full contents of files outside this packet on the theory that 'unchanged' cannot be trusted without them: the baseline evidence section below is Git-derived (commit hashes, blob hashes) precisely so unchanged state is verifiable without re-embedding it.",
+            "- Only report REVIEW_INCOMPLETE if a specific file this incremental diff actually touched, or a specific fixed auth-context file, is missing from this packet - not for optional/unrelated repository content."
+        ) -join "`n"
+        Add-Section -Title "Review mode: incremental" -RelPath "(review mode header)" -Content $headerLines -Tier 1
     }
 
     # --- Tier 1: governing docs + task ------------------------------------------------
@@ -327,15 +459,29 @@ function Build-ReviewPacket {
     Add-Section -Title "git diff --stat -M $diffRangeArg" -RelPath "(git diff --stat)" `
         -Content "$fence`n$diffStat`n$fence" -Tier 1
 
-    # --- Tier 2: full unified diff, relative to the SAME baseline used for
+    # --- Tier 1: full unified diff, relative to the SAME baseline used for
     # the file list below - staged and unstaged tracked changes combined,
-    # never a bare working-tree-vs-index diff. ------------------------------------------------
-    $baselineDescription = if ($mode -eq "uncommitted") { "HEAD (staged + unstaged combined)" } else { "the merge-base commit" }
+    # never a bare working-tree-vs-index diff. Tier 1 (not 2) unconditionally:
+    # the whole diff is exactly the evidence a review cannot meaningfully
+    # proceed without, in every mode. ------------------------------------------------
+    $baselineDescription = switch ($mode) {
+        "uncommitted"          { "HEAD (staged + unstaged combined)" }
+        "incremental"          { "the review baseline commit $baselineResolved (staged + unstaged combined)" }
+        default                 { "the merge-base commit" }
+    }
     $fullDiffLines = & git -C $RepoRoot diff --no-ext-diff -M --unified=80 @diffRangeArg
     $fullDiff = ($fullDiffLines | Out-String).Trim()
     if ([string]::IsNullOrWhiteSpace($fullDiff)) { $fullDiff = "(empty - no tracked-file changes; all changes are untracked new files, see below)" }
     Add-Section -Title "git diff --no-ext-diff -M --unified=80 $diffRangeArg (tracked-file changes, relative to $baselineDescription)" -RelPath "(git diff)" `
-        -Content "$fence`ndiff`n$fullDiff`n$fence" -Tier 2
+        -Content "$fence`ndiff`n$fullDiff`n$fence" -Tier 1
+
+    # In Incremental mode, every file the diff touches is Tier 1 (never
+    # droppable) - the whole point of this mode is that nothing the
+    # current repair actually changed can be silently omitted. In
+    # FullBranch mode, the default stays Tier 3 (droppable), same as
+    # before this mode existed - only $securityCriticalHints/
+    # $authTestCoverageHints-matched paths are pinned to Tier 1 there.
+    $defaultChangedFileTier = if ($mode -eq "incremental") { 1 } else { 3 }
 
     # --- Untracked files: enumerate, then split into relevant/excluded ------------------
     $untrackedAll = @(& git -C $RepoRoot ls-files --others --exclude-standard)
@@ -380,7 +526,7 @@ function Build-ReviewPacket {
     foreach ($relNorm in $relevantFiles) {
         $fullPath = Join-Path $RepoRoot $relNorm
         $content = Get-Content -Raw -Encoding utf8 -Path $fullPath
-        $tier = 3
+        $tier = $defaultChangedFileTier
         foreach ($hint in ($securityCriticalHints + $authTestCoverageHints)) {
             if ($relNorm.EndsWith($hint)) { $tier = 1; break }
         }
@@ -438,7 +584,7 @@ function Build-ReviewPacket {
             }
 
             $content = Get-Content -Raw -Encoding utf8 -Path $fullPath
-            $tier = 3
+            $tier = $defaultChangedFileTier
             foreach ($hint in ($securityCriticalHints + $authTestCoverageHints)) {
                 if ($newRel.EndsWith($hint)) { $tier = 1; break }
             }
@@ -489,7 +635,7 @@ function Build-ReviewPacket {
         }
 
         $content = Get-Content -Raw -Encoding utf8 -Path $fullPath
-        $tier = 3
+        $tier = $defaultChangedFileTier
         foreach ($hint in ($securityCriticalHints + $authTestCoverageHints)) {
             if ($relNorm.EndsWith($hint)) { $tier = 1; break }
         }
@@ -546,6 +692,148 @@ function Build-ReviewPacket {
 
     Add-Section -Title "Claude completion report" -RelPath "(completion report)" `
         -Content "NOT AVAILABLE - the implementation completion report was communicated in the chat session and was not persisted to a file in this repository." -Tier 1
+
+    if ($mode -eq "incremental") {
+        # --- Tier 2: fixed auth context files not already covered by the
+        # current diff - see $authContextAllowlist's header comment. -----
+        $liveEmbeddedNormalized = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($c in $reviewedCandidates) { [void]$liveEmbeddedNormalized.Add((ConvertTo-NormalizedReviewPath $c)) }
+        foreach ($contextPath in $authContextAllowlist) {
+            if ($liveEmbeddedNormalized.Contains((ConvertTo-NormalizedReviewPath $contextPath))) { continue }
+            $fullContextPath = Join-Path $RepoRoot $contextPath
+            if (-not (Test-Path $fullContextPath -PathType Leaf)) {
+                Add-Omitted -RelPath $contextPath -Reason "auth context file not found on disk - may have been renamed/removed"
+                continue
+            }
+            $contextContent = Get-Content -Raw -Encoding utf8 -Path $fullContextPath
+            Add-Section -Title "Context file (unchanged in this incremental range): $contextPath" -RelPath $contextPath `
+                -Content "$fence$(Get-FenceLang $contextPath)`n$contextContent`n$fence" -Tier 2
+            $reviewedCandidates.Add($contextPath)
+            [void]$liveEmbeddedNormalized.Add((ConvertTo-NormalizedReviewPath $contextPath))
+        }
+
+        if (-not $ExcludeContextManifest) {
+            # --- Tier 2: compact, Git-derived baseline evidence - commit
+            # list and blob hashes prove what changed (and what didn't)
+            # since the baseline WITHOUT re-embedding full file contents
+            # for anything the baseline itself already covers. -----------
+            $commitListRaw = ((& git -C $RepoRoot log --oneline "$baselineResolved..$toCommitResolved") | Out-String).Trim()
+            if ([string]::IsNullOrWhiteSpace($commitListRaw)) { $commitListRaw = "(no commits - baseline and target are the same commit)" }
+
+            $baselineSubject = ((& git -C $RepoRoot log -1 --format=%s $baselineResolved) | Out-String).Trim()
+            $headSubject = ((& git -C $RepoRoot log -1 --format=%s $toCommitResolved) | Out-String).Trim()
+
+            $blobHashLines = [System.Collections.Generic.List[string]]::new()
+            foreach ($contextPath in ($authContextAllowlist | Sort-Object)) {
+                $atBaseline = ((& git -C $RepoRoot rev-parse --verify --quiet "${baselineResolved}:${contextPath}") | Out-String).Trim()
+                if ([string]::IsNullOrWhiteSpace($atBaseline)) { $atBaseline = "(did not exist at baseline)" }
+                $atHead = ((& git -C $RepoRoot rev-parse --verify --quiet "${toCommitResolved}:${contextPath}") | Out-String).Trim()
+                if ([string]::IsNullOrWhiteSpace($atHead)) { $atHead = "(does not exist at HEAD)" }
+                $changedMarker = if ($atBaseline -eq $atHead) { "unchanged" } else { "CHANGED" }
+                $blobHashLines.Add("$contextPath : baseline=$atBaseline head=$atHead ($changedMarker)")
+            }
+
+            $baselineEvidenceLines = @(
+                "Repository root: $RepoRoot",
+                "Baseline commit: $baselineResolved ($baselineSubject)",
+                "Target/HEAD commit: $toCommitResolved ($headSubject)",
+                "",
+                "Commits in incremental scope (baseline..HEAD, oldest first shown by git log --oneline):",
+                $commitListRaw,
+                "",
+                "Fixed auth-context file blob hashes (proves, via Git object hashes rather than prose, exactly which context files this incremental range did or did not touch):",
+                ($blobHashLines -join "`n")
+            ) -join "`n"
+            Add-Section -Title "Baseline evidence (Git-derived)" -RelPath "(baseline evidence)" `
+                -Content $baselineEvidenceLines -Tier 2
+
+            # --- Tier 2: prior repair history - Git-derived (commit
+            # messages), not free text - explains WHY the baseline itself
+            # already contains what it contains, without re-embedding any
+            # of that code. Commit messages in this repository already
+            # document root cause + fix for each round (see `git log`
+            # above this baseline), so this is literally that log, not a
+            # hand-written summary. -----------------------------------
+            $repairHistoryBaseRef = $null
+            foreach ($candidate in $ProtectedBranches) {
+                & git -C $RepoRoot rev-parse --verify --quiet $candidate *>$null
+                if ($LASTEXITCODE -eq 0) { $repairHistoryBaseRef = $candidate; break }
+            }
+            if ($repairHistoryBaseRef) {
+                $repairHistoryBase = ((& git -C $RepoRoot merge-base $baselineResolved $repairHistoryBaseRef) | Out-String).Trim()
+                $repairHistoryRaw = ((& git -C $RepoRoot log --format="commit %H%n%B" "$repairHistoryBase..$baselineResolved") | Out-String).Trim()
+                if ([string]::IsNullOrWhiteSpace($repairHistoryRaw)) { $repairHistoryRaw = "(baseline commit has no ancestry beyond $repairHistoryBaseRef - nothing to summarize)" }
+                Add-Section -Title "Repair history already covered by the baseline (commit messages, $repairHistoryBase..$baselineResolved)" `
+                    -RelPath "(repair history)" -Content "$fence`n$repairHistoryRaw`n$fence" -Tier 2
+            }
+
+            # --- Tier 2: frontend-unchanged evidence - a compact manifest
+            # with blob hashes, never full re-embedded content, unless the
+            # incremental diff itself touched a frontend file (in which
+            # case it is already Tier 1 via the normal diff-collection
+            # loop above). ------------------------------------------------
+            $frontendChangedInRange = ((& git -C $RepoRoot diff --name-only -M $baselineResolved -- frontend) | Out-String).Trim()
+            $frontendTrackedFiles = @(& git -C $RepoRoot ls-files -- frontend) | Sort-Object
+            $frontendManifestLines = [System.Collections.Generic.List[string]]::new()
+            foreach ($fp in $frontendTrackedFiles) {
+                $fpHash = ((& git -C $RepoRoot rev-parse --verify --quiet "${toCommitResolved}:${fp}") | Out-String).Trim()
+                if ([string]::IsNullOrWhiteSpace($fpHash)) { $fpHash = "(not present at HEAD)" }
+                $frontendManifestLines.Add("$fp : $fpHash")
+            }
+            $frontendChangeStatusLine = if ([string]::IsNullOrWhiteSpace($frontendChangedInRange)) {
+                "No frontend files are touched by this incremental diff (baseline..HEAD, plus any staged/unstaged changes)."
+            } else {
+                "WARNING: the incremental diff DOES touch frontend files - they are embedded above via the normal diff-collection loop, not summarized here:`n$frontendChangedInRange"
+            }
+            $frontendEvidenceLines = @(
+                $frontendChangeStatusLine,
+                "",
+                "Frontend quality evidence (lint/typecheck/build) is embedded in full via the quality-gate report section above - not duplicated here.",
+                "",
+                "Tracked frontend file manifest at HEAD ($($frontendTrackedFiles.Count) files, path : blob hash):",
+                ($frontendManifestLines -join "`n")
+            ) -join "`n"
+            Add-Section -Title "Frontend unchanged-state evidence" -RelPath "(frontend evidence)" `
+                -Content $frontendEvidenceLines -Tier 2
+        }
+
+        # ---------------------------------------------------------------
+        # Changed-file completeness validation: every path `git diff
+        # --name-status` reports for $diffRangeArg must correspond to a
+        # Tier <= 2 section (added/modified/renamed-new-path), a deleted-
+        # file entry, or a renamed-old-path entry. This is deliberately a
+        # hard `throw` (never a partially-built, silently-incomplete
+        # packet) - an incremental review that cannot prove it saw every
+        # changed file is worse than no review, since a wrong "nothing
+        # missing" packet would look identical to a genuinely complete one.
+        # ---------------------------------------------------------------
+        $completenessNameStatus = @(& git -C $RepoRoot diff --name-status -M @diffRangeArg)
+        $embeddedForCompleteness = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($s in $sections) {
+            if ($s.Tier -le 2 -and $s.Path) { [void]$embeddedForCompleteness.Add((ConvertTo-NormalizedReviewPath $s.Path)) }
+        }
+        foreach ($d in $deletedFiles) { [void]$embeddedForCompleteness.Add((ConvertTo-NormalizedReviewPath $d)) }
+        foreach ($r in $renamedFiles) {
+            [void]$embeddedForCompleteness.Add((ConvertTo-NormalizedReviewPath $r.OldPath))
+            [void]$embeddedForCompleteness.Add((ConvertTo-NormalizedReviewPath $r.NewPath))
+        }
+        $missingFromManifest = [System.Collections.Generic.List[string]]::new()
+        foreach ($line in $completenessNameStatus) {
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            $fields = $line -split "`t"
+            $statusCode = $fields[0]
+            $checkPath = if ($statusCode.StartsWith("R") -or $statusCode.StartsWith("C")) { $fields[2] } else { $fields[1] }
+            $checkPathNorm = ConvertTo-NormalizedReviewPath ($checkPath -replace '\\', '/')
+            if (Test-ExcludedRelativePath -RelativePath $checkPath) { continue }
+            if (-not (Test-ReviewRelevantPath -RelNorm $checkPathNorm)) { continue }
+            if (-not $embeddedForCompleteness.Contains($checkPathNorm)) {
+                $missingFromManifest.Add("$statusCode`t$checkPath")
+            }
+        }
+        if ($missingFromManifest.Count -gt 0) {
+            throw "Incremental review packet is INCOMPLETE: the following file(s) changed in $baselineResolved..$toCommitResolved (plus working tree) but have no Tier<=2 section, deletion marker, or rename entry: $($missingFromManifest -join '; '). Packet generation refuses to produce a silently-incomplete review - fix Build-ReviewPacket's collection logic or this file's classification before retrying."
+        }
+    }
 
     # ---------------------------------------------------------------------------
     # Already-embedded dedup: ANY path currently embedded in $sections - not
@@ -725,6 +1013,73 @@ if ($ValidateDiffCollection) {
         if (@($rangePacket.ReviewedCandidates) -notcontains "ahead.md") {
             $failures.Add("Scenario 9: committed-range review did not include the committed file (ahead.md).")
         }
+
+        # 15: Incremental happy path - a baseline commit, one commit after
+        # it that changes a file, reviewed with -Incremental.
+        $incrementalBaseline = ((& git -C $tempRepo rev-parse HEAD) | Out-String).Trim()
+        Set-Content -Path (Join-Path $tempRepo "incr-changed.md") -Value "incremental change`n" -NoNewline
+        & git -C $tempRepo add "incr-changed.md" *>$null
+        & git -C $tempRepo commit -q -m "incremental repair commit" *>$null
+        $incrementalHead = ((& git -C $tempRepo rev-parse HEAD) | Out-String).Trim()
+
+        $incrementalPacket = Build-ReviewPacket -RepoRoot $tempRepo -Incremental -BaselineCommit $incrementalBaseline
+        if ($incrementalPacket.Mode -ne "incremental") {
+            $failures.Add("Scenario 15: -Incremental did not select incremental mode (got '$($incrementalPacket.Mode)').")
+        }
+        $incrChangedSection = $incrementalPacket.Sections | Where-Object { $_.Path -eq "incr-changed.md" } | Select-Object -First 1
+        if (-not $incrChangedSection) {
+            $failures.Add("Scenario 15: incremental review did not embed the file changed since baseline (incr-changed.md).")
+        } elseif ($incrChangedSection.Tier -ne 1) {
+            $failures.Add("Scenario 15: incremental review embedded the changed file at Tier $($incrChangedSection.Tier), expected Tier 1 (never droppable).")
+        }
+        $headerSection = $incrementalPacket.Sections | Where-Object { $_.Path -eq "(review mode header)" } | Select-Object -First 1
+        if (-not $headerSection -or $headerSection.Content -notmatch [regex]::Escape($incrementalBaseline)) {
+            $failures.Add("Scenario 15: incremental review-mode header does not state the baseline commit.")
+        }
+
+        # 16: baseline not an ancestor of the target - a sibling branch's
+        # commit used as baseline against main's HEAD must be refused.
+        & git -C $tempRepo checkout -q -b sibling-branch $incrementalBaseline *>$null
+        Set-Content -Path (Join-Path $tempRepo "sibling-only.md") -Value "sibling`n" -NoNewline
+        & git -C $tempRepo add "sibling-only.md" *>$null
+        & git -C $tempRepo commit -q -m "sibling commit" *>$null
+        $siblingCommit = ((& git -C $tempRepo rev-parse HEAD) | Out-String).Trim()
+        & git -C $tempRepo checkout -q main *>$null
+        & git -C $tempRepo branch -q -D sibling-branch *>$null
+
+        $notAncestorThrew = $false
+        try {
+            Build-ReviewPacket -RepoRoot $tempRepo -Incremental -BaselineCommit $siblingCommit -ToCommit $incrementalHead | Out-Null
+        } catch {
+            $notAncestorThrew = $true
+        }
+        if (-not $notAncestorThrew) {
+            $failures.Add("Scenario 16: -Incremental did not reject a baseline commit that is not an ancestor of the target.")
+        }
+
+        # 17: invalid/unresolvable baseline commit hash must be refused.
+        $invalidHashThrew = $false
+        try {
+            Build-ReviewPacket -RepoRoot $tempRepo -Incremental -BaselineCommit "0000000000000000000000000000000000000000" | Out-Null
+        } catch {
+            $invalidHashThrew = $true
+        }
+        if (-not $invalidHashThrew) {
+            $failures.Add("Scenario 17: -Incremental did not reject an unresolvable -BaselineCommit hash.")
+        }
+
+        # 18: an explicit -ToCommit that does not match actual current
+        # HEAD must be refused, never silently reviewed against the wrong
+        # target.
+        $headMismatchThrew = $false
+        try {
+            Build-ReviewPacket -RepoRoot $tempRepo -Incremental -BaselineCommit $incrementalBaseline -ToCommit $incrementalBaseline | Out-Null
+        } catch {
+            $headMismatchThrew = $true
+        }
+        if (-not $headMismatchThrew) {
+            $failures.Add("Scenario 18: -Incremental did not reject a -ToCommit that does not match actual current HEAD.")
+        }
     } finally {
         Remove-Item -Recurse -Force $tempRepo -ErrorAction SilentlyContinue
     }
@@ -735,7 +1090,7 @@ if ($ValidateDiffCollection) {
         exit 1
     }
 
-    Write-Host "Diff-collection validation PASSED (14 scenarios, disposable repo at $tempRepo, now removed)."
+    Write-Host "Diff-collection validation PASSED (18 scenarios, disposable repo at $tempRepo, now removed)."
     exit 0
 }
 
@@ -747,7 +1102,9 @@ if (-not (Test-CommandAvailable "codex")) {
 Set-Location $root
 
 $config = Get-WorkflowConfig
-$packet = Build-ReviewPacket -RepoRoot $root -ProtectedBranches $config.protectedBranches
+$packet = Build-ReviewPacket -RepoRoot $root -ProtectedBranches $config.protectedBranches `
+    -Incremental:$Incremental -BaselineCommit $BaselineCommit -ToCommit $ToCommit `
+    -ExcludeContextManifest:$ExcludeContextManifest
 
 if ($packet.Mode -eq "nothing-to-review") {
     Write-Host $packet.NothingToReviewReason
@@ -755,6 +1112,9 @@ if ($packet.Mode -eq "nothing-to-review") {
 }
 if ($packet.Mode -eq "clean-committed-range") {
     Write-Host "Working tree is clean - reviewing the committed range $($packet.DiffRangeArg[0]) instead."
+}
+if ($packet.Mode -eq "incremental") {
+    Write-Host "Incremental review: baseline $($packet.DiffRangeArg[0]) -> current HEAD."
 }
 
 $branch = (& git rev-parse --abbrev-ref HEAD).Trim()
@@ -797,6 +1157,13 @@ $schemaPath       = Join-Path $root ".ai-workflow\prompts\review-output-schema.j
 $MaxPacketChars = 950000
 $sections = $packet.Sections
 
+# Incremental mode's Tier 2 (fixed auth context, baseline evidence,
+# frontend-unchanged evidence) must NOT be droppable the way FullBranch's
+# Tier 2 (the full diff - now itself promoted to Tier 1, see
+# Build-ReviewPacket) historically was - only Tier 3 is fair game in
+# Incremental mode. FullBranch mode's threshold is unchanged.
+$dropThreshold = if ($packet.Mode -eq "incremental") { 2 } else { 1 }
+
 function Get-TotalChars {
     param([System.Collections.Generic.List[hashtable]]$Secs)
     $total = 0
@@ -806,7 +1173,7 @@ function Get-TotalChars {
 
 $totalChars = Get-TotalChars -Secs $sections
 if ($totalChars -gt $MaxPacketChars) {
-    $droppable = $sections | Where-Object { $_.Tier -gt 1 } | Sort-Object -Property Tier -Descending
+    $droppable = $sections | Where-Object { $_.Tier -gt $dropThreshold } | Sort-Object -Property Tier -Descending
     foreach ($candidate in $droppable) {
         if ($totalChars -le $MaxPacketChars) { break }
         $sections.Remove($candidate) | Out-Null
@@ -980,7 +1347,18 @@ if ($ValidateProvenance) {
 
 if ($DryRun) {
     Write-Host "Dry run: packet written to $packetPath ($finalTotalChars chars), prompt written to $promptPath."
-    Write-Host "Reviewed-file candidates: $($packet.ReviewedCandidates.Count); omitted: $($packet.Omitted.Count)."
+    Write-Host "Mode: $($packet.Mode). Reviewed-file candidates: $($packet.ReviewedCandidates.Count); omitted: $($packet.Omitted.Count)."
+    Write-Host "Budget: $MaxPacketChars chars (drop threshold: Tier > $dropThreshold)."
+    $tierGroups = $sections | Group-Object -Property Tier | Sort-Object -Property Name
+    foreach ($g in $tierGroups) {
+        $tierChars = ($g.Group | ForEach-Object { $_.Content.Length } | Measure-Object -Sum).Sum
+        Write-Host "  Tier $($g.Name): $($g.Count) section(s), $tierChars chars."
+    }
+    $largest = $sections | Sort-Object -Property { $_.Content.Length } -Descending | Select-Object -First 5
+    Write-Host "Largest 5 sections:"
+    foreach ($s in $largest) {
+        Write-Host "  $($s.Content.Length) chars - Tier $($s.Tier) - $($s.Title)"
+    }
     Write-Host "Codex was NOT invoked (-DryRun)."
     exit 0
 }
