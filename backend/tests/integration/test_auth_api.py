@@ -52,6 +52,31 @@ def _csrf_headers(client) -> dict[str, str]:
     return {"X-CSRF-Token": client.cookies.get("csrf_token")}
 
 
+CSRF_COOKIE_NAME = "csrf_token"
+
+
+def _set_cookie_headers(response) -> list[str]:
+    return response.headers.get_list("set-cookie")
+
+
+def _cookie_clear_header(response, name: str) -> str | None:
+    for header in _set_cookie_headers(response):
+        if header.startswith(f"{name}="):
+            return header
+    return None
+
+
+def _assert_cookie_cleared(response, name: str) -> None:
+    header = _cookie_clear_header(response, name)
+    assert header is not None, f"expected a Set-Cookie header clearing {name!r}"
+    lowered = header.lower()
+    assert "max-age=0" in lowered
+    assert "path=/" in lowered
+    # The cleared cookie's own value must never carry the raw token.
+    value = header.split(";", 1)[0].split("=", 1)[1]
+    assert value in ("", '""')
+
+
 def test_valid_login_creates_session_and_secure_cookie(client, app, auth_tenancy):
     _override_generous_rate_limiter(app)
     response = _login(client, auth_tenancy.owner_user.normalized_email, auth_tenancy.owner_password)
@@ -69,6 +94,10 @@ def test_invalid_password_returns_generic_failure(client, app, auth_tenancy):
 
     assert response.status_code == 401
     assert SESSION_COOKIE_NAME not in client.cookies
+    # A failed login never carried a session cookie to begin with - it
+    # must not emit any cookie-clearing Set-Cookie header either.
+    assert _cookie_clear_header(response, SESSION_COOKIE_NAME) is None
+    assert _cookie_clear_header(response, CSRF_COOKIE_NAME) is None
 
 
 def test_nonexistent_account_has_the_same_response_shape(client, app, auth_tenancy):
@@ -129,6 +158,21 @@ def test_me_returns_safe_identity_fields(client, app, auth_tenancy):
 def test_me_without_a_session_is_unauthorized(client):
     response = client.get(ME_URL)
     assert response.status_code == 401
+    # No session cookie was ever sent - there is nothing stale to clear,
+    # and this must not be treated as if there were.
+    assert _cookie_clear_header(response, SESSION_COOKIE_NAME) is None
+    assert _cookie_clear_header(response, CSRF_COOKIE_NAME) is None
+
+
+def test_valid_session_request_does_not_clear_cookies(client, app, auth_tenancy):
+    _override_generous_rate_limiter(app)
+    _login(client, auth_tenancy.owner_user.normalized_email, auth_tenancy.owner_password)
+
+    response = client.get(ME_URL)
+
+    assert response.status_code == 200
+    assert _cookie_clear_header(response, SESSION_COOKIE_NAME) is None
+    assert _cookie_clear_header(response, CSRF_COOKIE_NAME) is None
 
 
 def test_logout_revokes_session_and_clears_cookie(client, app, auth_tenancy):
@@ -151,12 +195,20 @@ def test_logout_is_idempotent_without_a_session(client):
 def test_revoked_session_cannot_be_reused(client, app, auth_tenancy):
     _override_generous_rate_limiter(app)
     _login(client, auth_tenancy.owner_user.normalized_email, auth_tenancy.owner_password)
+    # Captured BEFORE logout: logout's own Set-Cookie (Max-Age=0) makes
+    # httpx remove session_token from the jar immediately, so reading it
+    # afterward would just be None.
+    stale_cookie = client.cookies.get(SESSION_COOKIE_NAME)
+    stale_csrf = client.cookies.get(CSRF_COOKIE_NAME)
     client.post(LOGOUT_URL, headers=_csrf_headers(client))
 
-    stale_cookie = client.cookies.get(SESSION_COOKIE_NAME)
     client.cookies.set(SESSION_COOKIE_NAME, stale_cookie)
+    client.cookies.set(CSRF_COOKIE_NAME, stale_csrf)
     response = client.get(ME_URL)
+
     assert response.status_code == 401
+    _assert_cookie_cleared(response, SESSION_COOKIE_NAME)
+    _assert_cookie_cleared(response, CSRF_COOKIE_NAME)
 
 
 def test_absolute_expired_session_is_rejected(client, app, auth_tenancy, db_session):
@@ -173,6 +225,8 @@ def test_absolute_expired_session_is_rejected(client, app, auth_tenancy, db_sess
 
     response = client.get(ME_URL)
     assert response.status_code == 401
+    _assert_cookie_cleared(response, SESSION_COOKIE_NAME)
+    _assert_cookie_cleared(response, CSRF_COOKIE_NAME)
 
 
 def test_idle_expired_session_is_rejected(client, app, auth_tenancy, db_session):
@@ -189,6 +243,119 @@ def test_idle_expired_session_is_rejected(client, app, auth_tenancy, db_session)
 
     response = client.get(ME_URL)
     assert response.status_code == 401
+    _assert_cookie_cleared(response, SESSION_COOKIE_NAME)
+    _assert_cookie_cleared(response, CSRF_COOKIE_NAME)
+
+
+def test_unknown_session_token_clears_stale_cookies(client):
+    client.cookies.set(SESSION_COOKIE_NAME, "this-token-was-never-issued")
+    client.cookies.set(CSRF_COOKIE_NAME, "some-stale-csrf-value")
+
+    response = client.get(ME_URL)
+
+    assert response.status_code == 401
+    _assert_cookie_cleared(response, SESSION_COOKIE_NAME)
+    _assert_cookie_cleared(response, CSRF_COOKIE_NAME)
+
+
+def test_malformed_session_token_clears_stale_cookies(client):
+    # Not a real token shape at all (session tokens are
+    # secrets.token_urlsafe(32) output) - still just an unknown-token
+    # lookup miss, same code path as any other unrecognized token, but
+    # covered explicitly per task.md's required test list.
+    client.cookies.set(SESSION_COOKIE_NAME, "%%%not-a-real-token-shape%%%")
+    client.cookies.set(CSRF_COOKIE_NAME, "some-stale-csrf-value")
+
+    response = client.get(ME_URL)
+
+    assert response.status_code == 401
+    _assert_cookie_cleared(response, SESSION_COOKIE_NAME)
+    _assert_cookie_cleared(response, CSRF_COOKIE_NAME)
+
+
+def test_inactive_account_session_clears_stale_cookies(client, app, auth_tenancy, db_session):
+    _override_generous_rate_limiter(app)
+    _login(client, auth_tenancy.owner_user.normalized_email, auth_tenancy.owner_password)
+
+    db_session.execute(
+        text("UPDATE user_accounts SET status = 'inactive' WHERE id = :user_id"),
+        {"user_id": str(auth_tenancy.owner_user.id)},
+    )
+    db_session.flush()
+    # The raw UPDATE above bypasses the ORM - the already-loaded
+    # UserAccount instance in this shared session's identity map still
+    # has status=active in memory until it's expired and re-fetched.
+    db_session.expire_all()
+
+    response = client.get(ME_URL)
+
+    assert response.status_code == 401
+    _assert_cookie_cleared(response, SESSION_COOKIE_NAME)
+    _assert_cookie_cleared(response, CSRF_COOKIE_NAME)
+
+
+def test_stale_session_response_never_logs_the_raw_token(client, caplog):
+    client.cookies.set(SESSION_COOKIE_NAME, "this-token-was-never-issued")
+
+    with caplog.at_level(logging.DEBUG):
+        response = client.get(ME_URL)
+
+    assert response.status_code == 401
+    for record in caplog.records:
+        assert "this-token-was-never-issued" not in record.getMessage()
+
+
+def test_client_can_log_in_again_after_a_stale_session_response(
+    client, app, auth_tenancy, db_session
+):
+    # Revoked server-side (rather than via logout + a manually re-injected
+    # cookie) so the client's cookie jar only ever holds cookies the
+    # server itself actually set - manually calling client.cookies.set()
+    # for a name the server will set again later in the same test causes
+    # httpx to see two conflicting entries (different implicit cookie
+    # domains) for that name.
+    _override_generous_rate_limiter(app)
+    _login(client, auth_tenancy.owner_user.normalized_email, auth_tenancy.owner_password)
+
+    db_session.execute(
+        text("UPDATE auth_sessions SET revoked_at = now() WHERE user_id = :user_id"),
+        {"user_id": str(auth_tenancy.owner_user.id)},
+    )
+    db_session.flush()
+
+    stale_response = client.get(ME_URL)
+    assert stale_response.status_code == 401
+
+    fresh_login = _login(
+        client, auth_tenancy.owner_user.normalized_email, auth_tenancy.owner_password
+    )
+    assert fresh_login.status_code == 200
+    assert client.get(ME_URL).status_code == 200
+
+
+def test_forbidden_response_does_not_clear_a_valid_session_cookie(client, app, auth_tenancy):
+    """A 403 (insufficient role) is not a session problem at all - the
+    session itself is perfectly valid, so it must never be cleared."""
+    _override_generous_rate_limiter(app)
+    _login(
+        client, auth_tenancy.dual_clinic_user.normalized_email, auth_tenancy.dual_clinic_password
+    )
+    client.post(
+        SELECT_CLINIC_URL,
+        json={"tenant_id": str(auth_tenancy.tenant_a.id)},
+        headers=_csrf_headers(client),
+    )
+
+    # dual_clinic_user is only a MANAGER in tenant_a - clinic name updates
+    # require OWNER.
+    response = client.patch(
+        "/api/v1/clinic", json={"name": "Hijacked Name"}, headers=_csrf_headers(client)
+    )
+
+    assert response.status_code == 403
+    assert _cookie_clear_header(response, SESSION_COOKIE_NAME) is None
+    assert _cookie_clear_header(response, CSRF_COOKIE_NAME) is None
+    assert client.get(ME_URL).status_code == 200
 
 
 def test_clinics_list_includes_only_active_memberships(client, app, auth_tenancy):
@@ -605,3 +772,36 @@ def test_invitation_accept_rejects_extra_fields_attempting_to_override_tenant_or
         },
     )
     assert response.status_code == 422
+
+
+def test_invalid_invitation_token_does_not_clear_unrelated_auth_cookies(client):
+    """An anonymous invitation-acceptance failure has nothing to do with
+    the caller's own session state (there usually isn't one) - it must
+    never trigger the session-cookie-clearing behavior reserved for a
+    stale session cookie."""
+    response = client.post(
+        "/api/v1/auth/invitations/accept",
+        json={
+            "token": "this-invitation-token-was-never-issued",
+            "display_name": "Someone",
+            "password": "a brand new invitee passphrase!",
+        },
+    )
+
+    assert response.status_code == 400
+    assert _cookie_clear_header(response, SESSION_COOKIE_NAME) is None
+    assert _cookie_clear_header(response, CSRF_COOKIE_NAME) is None
+
+
+def test_invalid_password_reset_token_does_not_clear_unrelated_auth_cookies(client):
+    response = client.post(
+        "/api/v1/auth/password-reset/confirm",
+        json={
+            "token": "this-reset-token-was-never-issued",
+            "new_password": "a brand new password!",
+        },
+    )
+
+    assert response.status_code == 400
+    assert _cookie_clear_header(response, SESSION_COOKIE_NAME) is None
+    assert _cookie_clear_header(response, CSRF_COOKIE_NAME) is None

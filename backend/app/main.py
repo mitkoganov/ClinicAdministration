@@ -9,6 +9,7 @@ from app.api.tenant_scoped_records import router as tenant_scoped_records_router
 from app.core.config import get_settings
 from app.core.errors import register_error_handlers
 from app.core.logging import configure_logging
+from app.core.session_cookies import register_invalid_session_cookie_clearing
 
 
 def create_app() -> FastAPI:
@@ -22,6 +23,7 @@ def create_app() -> FastAPI:
     )
 
     register_error_handlers(app)
+    register_invalid_session_cookie_clearing(app)
     app.include_router(health_router)
     app.include_router(auth_router)
     app.include_router(tenant_context_router)

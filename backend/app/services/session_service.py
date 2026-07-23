@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 
 from app.core.audit import AuditEvent, AuditOutcome, emit_audit_event
 from app.core.config import Settings
-from app.core.errors import NotFoundError, UnauthorizedError
+from app.core.errors import InvalidSessionError, NotFoundError, UnauthorizedError
 from app.core.session_tokens import generate_token, hash_token
 from app.models.auth_session import AuthSession
 from app.models.membership import MembershipStatus
@@ -82,19 +82,28 @@ class SessionService:
         return CreatedSession(session=session, raw_token=raw_token, raw_csrf_token=raw_csrf_token)
 
     def validate_session(self, raw_token: str) -> ValidatedSession:
+        """Every rejection below means a session cookie WAS presented but
+        turned out unusable - raised as `InvalidSessionError` (not the
+        plain `UnauthorizedError` a missing cookie gets) so the caller can
+        clear the now-useless cookies (see app.core.session_cookies's
+        dedicated exception handler). A transient commit failure during
+        the idle-refresh touch below is deliberately NOT included - the
+        session itself is still valid, this request just failed to
+        record its own activity, and a retry may well succeed without
+        forcing a fresh login."""
         session = self._sessions.get_by_token_hash(hash_token(raw_token))
         if session is None:
-            raise UnauthorizedError()
+            raise InvalidSessionError()
         if session.revoked_at is not None:
-            raise UnauthorizedError()
+            raise InvalidSessionError()
 
         now = datetime.now(UTC)
         if now >= session.absolute_expires_at or now >= session.idle_expires_at:
-            raise UnauthorizedError()
+            raise InvalidSessionError()
 
         user = self._users.get_by_id(session.user_id)
         if user is None or user.status != UserAccountStatus.ACTIVE:
-            raise UnauthorizedError()
+            raise InvalidSessionError()
 
         if now - session.last_seen_at >= TOUCH_THRESHOLD:
             self._sessions.touch(
