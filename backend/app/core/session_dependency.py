@@ -87,11 +87,23 @@ def get_current_session_or_none_if_stale(
     must keep using `get_current_session_optional` (which re-raises
     `InvalidSessionError`) so tenant-scoped routes, CSRF checks on other
     mutations, and every other 401 path still clear stale cookies via the
-    dedicated handler instead of silently treating them as absent."""
+    dedicated handler instead of silently treating them as absent.
+
+    Deliberately catches only `InvalidSessionError`, not the broader
+    `UnauthorizedError` it subclasses: `validate_session` also raises the
+    plain `UnauthorizedError` for a transient touch-refresh commit
+    failure (see its docstring) - the session itself may still be
+    perfectly valid, the request just failed to record its own activity.
+    Collapsing THAT into `None` would make logout return a false 200
+    (idempotent-no-session success) without ever having revoked a session
+    that is still live server-side. Letting it propagate instead reaches
+    the generic `AppError` handler - a plain 401, no cookie clearing, no
+    exception detail - exactly like every other route already gets for
+    this same failure, so this fix changes no other route's behavior."""
     raw_token = _extract_session_token(request)
     if not raw_token:
         return None
     try:
         return SessionService(db, settings).validate_session(raw_token)
-    except UnauthorizedError:
+    except InvalidSessionError:
         return None

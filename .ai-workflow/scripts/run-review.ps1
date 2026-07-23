@@ -117,6 +117,50 @@ $excludedTopLevelDirs = @("reports")
 $includedRootExtensions = @(".md", ".yml", ".yaml", ".toml", ".json")
 $includedRootFilenames = @("docker-compose.yml", "docker-compose.override.yml", ".env.example", ".gitignore")
 
+function ConvertTo-NormalizedReviewPath {
+    # Canonical form used ONLY for set-membership comparison (never for
+    # display - callers keep the original path for that). Collapses the
+    # differences that would otherwise defeat the already-embedded dedup
+    # below: backslash vs forward-slash (Windows `git`/PowerShell paths),
+    # a redundant leading "./", and casing (Windows paths are
+    # case-insensitive, so "Task.md" and "task.md" must dedup as the same
+    # file even though Git itself is case-sensitive about it).
+    param([string]$Path)
+    $normalized = ($Path -replace '\\', '/').Trim('/')
+    while ($normalized.StartsWith('./')) { $normalized = $normalized.Substring(2) }
+    return $normalized.ToLowerInvariant()
+}
+
+function Remove-AlreadyEmbeddedOmissions {
+    # A path currently embedded in $Sections (a governing document,
+    # allowlisted evidence, or tracked/untracked file content) must never
+    # also appear in $Omitted. The per-loop Add-Omitted calls in
+    # Build-ReviewPacket only see one path at a time and have no way to
+    # know a governing document (e.g. tasks/current/task.md) was already
+    # embedded via its own dedicated section before the generic
+    # tracked-file diff loop encounters that same path again and rejects
+    # it as "not under a reviewed directory". Mutates $Omitted in place
+    # (Clear + re-add) so every reference to the same List object -
+    # including the one already captured in a returned packet hashtable -
+    # sees the correction.
+    param(
+        [System.Collections.Generic.List[hashtable]]$Sections,
+        [System.Collections.Generic.List[hashtable]]$Omitted
+    )
+    $embedded = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($s in $Sections) {
+        if ($s.Path) { [void]$embedded.Add((ConvertTo-NormalizedReviewPath $s.Path)) }
+    }
+    $kept = [System.Collections.Generic.List[hashtable]]::new()
+    foreach ($o in $Omitted) {
+        if (-not $embedded.Contains((ConvertTo-NormalizedReviewPath $o.Path))) {
+            $kept.Add($o)
+        }
+    }
+    $Omitted.Clear()
+    foreach ($k in $kept) { $Omitted.Add($k) }
+}
+
 function Get-FenceLang {
     param([string]$Path)
     switch ([System.IO.Path]::GetExtension($Path).ToLowerInvariant()) {
@@ -480,21 +524,21 @@ function Build-ReviewPacket {
         -Content "NOT AVAILABLE - the implementation completion report was communicated in the chat session and was not persisted to a file in this repository." -Tier 1
 
     # ---------------------------------------------------------------------------
-    # Evidence-vs-omitted dedup: a file explicitly embedded via
-    # Add-EvidenceSection must never also appear in the final omitted list, even
-    # though the generic reports/ collection pass (which runs before these
-    # dedicated sections) may have already recorded it there under a generic
-    # "not under a reviewed directory" reason. Everything else that pass
-    # recorded - including this tooling's own self-referential output
-    # (review-latest.md, codex-review-*.{md,txt,json} under the task's reports
-    # subfolder) - is NOT in $EvidenceAllowlist and stays correctly omitted.
+    # Already-embedded dedup: ANY path currently embedded in $sections - not
+    # just allowlisted evidence (reports/quality-gates-latest.md etc.), but
+    # also governing documents (tasks/current/task.md, AGENTS.md, ...) and any
+    # tracked/untracked file - must never also appear in the final omitted
+    # list. The generic collection passes above only see one path at a time
+    # and have no way to know, e.g., that a governing document was already
+    # embedded via its own dedicated section before the tracked-file diff loop
+    # encountered that same path again and rejected it as "not under a
+    # reviewed directory" - this is what previously let a fully-reviewed
+    # governing document still show up under "## Omitted files". Everything
+    # this pass does NOT match - including this tooling's own self-referential
+    # output (review-latest.md, codex-review-*.{md,txt,json}) - stays
+    # correctly omitted.
     # ---------------------------------------------------------------------------
-    $embeddedPaths = @($embeddedEvidence | ForEach-Object { $_.Path })
-    if ($embeddedPaths.Count -gt 0) {
-        $omitted = [System.Collections.Generic.List[hashtable]]::new(
-            [hashtable[]]@($omitted | Where-Object { $embeddedPaths -notcontains $_.Path })
-        )
-    }
+    Remove-AlreadyEmbeddedOmissions -Sections $sections -Omitted $omitted
 
     return @{
         Mode = $mode
@@ -522,6 +566,24 @@ function Build-ReviewPacket {
 # ===========================================================================
 if ($ValidateDiffCollection) {
     $failures = [System.Collections.Generic.List[string]]::new()
+
+    # 13/14: Remove-AlreadyEmbeddedOmissions dedup, tested directly against
+    # synthetic Sections/Omitted lists - independent of any real repo state,
+    # so it exercises the exact backslash-vs-slash and casing-variant cases
+    # the LOW finding's normalized-path requirement calls for.
+    $dedupSections = [System.Collections.Generic.List[hashtable]]::new()
+    $dedupSections.Add(@{ Path = "tasks/current/task.md"; Content = "embedded" })
+    $dedupOmitted = [System.Collections.Generic.List[hashtable]]::new()
+    $dedupOmitted.Add(@{ Path = "tasks\current\Task.md"; Reason = "not under a reviewed directory or a recognized root config/doc type" })
+    $dedupOmitted.Add(@{ Path = "backend/tests/unit/test_rate_limit.py"; Reason = "dropped: packet exceeded the 1300000-character size budget" })
+    Remove-AlreadyEmbeddedOmissions -Sections $dedupSections -Omitted $dedupOmitted
+    if (@($dedupOmitted | Where-Object { (ConvertTo-NormalizedReviewPath $_.Path) -eq (ConvertTo-NormalizedReviewPath "tasks/current/task.md") }).Count -gt 0) {
+        $failures.Add("Scenario 13: Remove-AlreadyEmbeddedOmissions did not dedup a backslash + casing variant of an already-embedded path.")
+    }
+    if (@($dedupOmitted | Where-Object { $_.Path -eq "backend/tests/unit/test_rate_limit.py" }).Count -ne 1) {
+        $failures.Add("Scenario 14: Remove-AlreadyEmbeddedOmissions incorrectly removed a genuinely (non-embedded) omitted path.")
+    }
+
     $tempRepo = Join-Path ([System.IO.Path]::GetTempPath()) ("review-packet-validation-" + [System.Guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Path $tempRepo | Out-Null
 
@@ -649,7 +711,7 @@ if ($ValidateDiffCollection) {
         exit 1
     }
 
-    Write-Host "Diff-collection validation PASSED (12 scenarios, disposable repo at $tempRepo, now removed)."
+    Write-Host "Diff-collection validation PASSED (14 scenarios, disposable repo at $tempRepo, now removed)."
     exit 0
 }
 
@@ -720,6 +782,14 @@ if ($totalChars -gt $MaxPacketChars) {
         $totalChars = Get-TotalChars -Secs $sections
     }
 }
+
+# --- Re-run the same already-embedded dedup after the size-drop loop
+# above: dropping a section removes it from $sections, so a genuinely
+# budget-dropped file is (correctly) not in $sections any more and stays
+# listed as omitted - this call only catches the case where a section
+# survives the drop but an earlier Add-Omitted call for that same
+# (now-stale) reason was never cleaned up.
+Remove-AlreadyEmbeddedOmissions -Sections $sections -Omitted $packet.Omitted
 
 $finalTotalChars = Get-TotalChars -Secs $sections
 if ($finalTotalChars -gt $MaxPacketChars -or $packet.MissingGoverningDocsCount -eq $packet.GoverningDocsCount) {
@@ -818,6 +888,39 @@ if ($ValidateProvenance) {
     $overlap = @($embeddedPathSet | Where-Object { $omittedPathSet -contains $_ })
     if ($overlap.Count -gt 0) {
         $failures.Add("Path(s) appear in both embedded-evidence and omitted: $($overlap -join ', ')")
+    }
+
+    # 8: every governing document that exists on disk is embedded exactly
+    # once in $sections (as its own "Governing document: ..." section) and
+    # never also appears under "## Omitted files" - this is the exact
+    # contradiction the LOW finding reported for tasks/current/task.md.
+    $normalizedOmitted = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($p in $omittedPathSet) { [void]$normalizedOmitted.Add((ConvertTo-NormalizedReviewPath $p)) }
+    foreach ($doc in $governingDocs) {
+        $full = Join-Path $root $doc
+        if (-not (Test-Path $full)) { continue }
+        $displayPath = $doc -replace '\\', '/'
+        $matchingSections = @($packet.Sections | Where-Object {
+            (ConvertTo-NormalizedReviewPath $_.Path) -eq (ConvertTo-NormalizedReviewPath $displayPath)
+        })
+        if ($matchingSections.Count -ne 1) {
+            $failures.Add("Governing document '$displayPath' is embedded $($matchingSections.Count) time(s); expected exactly 1.")
+        }
+        if ($normalizedOmitted.Contains((ConvertTo-NormalizedReviewPath $displayPath))) {
+            $failures.Add("Governing document '$displayPath' is embedded but also appears under '## Omitted files'.")
+        }
+    }
+
+    # 9: normalized-path dedup itself - a backslash path and its
+    # forward-slash equivalent, and a casing variant, must compare equal.
+    if ((ConvertTo-NormalizedReviewPath "tasks\current\task.md") -ne (ConvertTo-NormalizedReviewPath "tasks/current/task.md")) {
+        $failures.Add("Path normalization does not dedup backslash vs forward-slash paths.")
+    }
+    if ((ConvertTo-NormalizedReviewPath "Tasks/Current/Task.md") -ne (ConvertTo-NormalizedReviewPath "tasks/current/task.md")) {
+        $failures.Add("Path normalization does not dedup casing variants.")
+    }
+    if ((ConvertTo-NormalizedReviewPath "./tasks/current/task.md") -ne (ConvertTo-NormalizedReviewPath "tasks/current/task.md")) {
+        $failures.Add("Path normalization does not strip a redundant leading './'.")
     }
 
     # 7: deterministic ordering - re-running Sort-Object on the same input

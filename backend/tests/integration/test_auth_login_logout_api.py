@@ -6,6 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import text
 
+from app.core.errors import ConflictError
 from app.core.session_dependency import SESSION_COOKIE_NAME
 from tests.integration.auth_api_helpers import (
     CSRF_COOKIE_NAME,
@@ -272,6 +273,74 @@ def test_logout_with_valid_session_and_valid_csrf_revokes_it(client, app, auth_t
         {"user_id": str(auth_tenancy.owner_user.id)},
     ).scalar_one()
     assert revoked_at is not None
+
+
+# --- Codex repair (HIGH): a transient failure while persisting the
+# session's own idle-refresh touch must never be collapsed into the
+# same idempotent-success response reserved for a genuinely stale
+# session - the session is still valid server-side, so a false 200
+# here would tell the caller logout succeeded while it never revoked
+# anything. --------------------------------------------------------
+
+
+def test_logout_with_transient_touch_commit_failure_does_not_return_false_success(
+    client, app, auth_tenancy, db_session
+):
+    _override_generous_rate_limiter(app)
+    _login(client, auth_tenancy.owner_user.normalized_email, auth_tenancy.owner_password)
+
+    # Force the idle-refresh touch to be due (TOUCH_THRESHOLD is 5 minutes).
+    db_session.execute(
+        text("UPDATE auth_sessions SET last_seen_at = :past WHERE user_id = :user_id"),
+        {
+            "past": datetime.now(UTC) - timedelta(minutes=10),
+            "user_id": str(auth_tenancy.owner_user.id),
+        },
+    )
+    db_session.flush()
+
+    with patch.object(db_session, "commit", side_effect=RuntimeError("simulated commit failure")):
+        response = client.post(LOGOUT_URL, headers=_csrf_headers(client))
+
+    assert response.status_code != 200
+    assert "simulated commit failure" not in response.text
+    assert "RuntimeError" not in response.text
+    assert _cookie_clear_header(response, SESSION_COOKIE_NAME) is None
+    assert _cookie_clear_header(response, CSRF_COOKIE_NAME) is None
+
+    db_session.expire_all()
+    revoked_at = db_session.execute(
+        text("SELECT revoked_at FROM auth_sessions WHERE user_id = :user_id"),
+        {"user_id": str(auth_tenancy.owner_user.id)},
+    ).scalar_one()
+    assert revoked_at is None
+
+    # The injected failure was transient - a retry (no longer patched)
+    # must be able to complete a real, successful logout.
+    retry_response = client.post(LOGOUT_URL, headers=_csrf_headers(client))
+    assert retry_response.status_code == 200
+    _assert_cookie_cleared(retry_response, SESSION_COOKIE_NAME)
+    _assert_cookie_cleared(retry_response, CSRF_COOKIE_NAME)
+
+
+def test_logout_propagates_a_non_session_apperror_without_collapsing_it(client, app, auth_tenancy):
+    """Defensive regression: the logout resolver's except clause must
+    stay narrowed to InvalidSessionError - simulate an unrelated AppError
+    from SessionService.validate_session (not something that happens in
+    practice today) and confirm it still is not collapsed into the same
+    idempotent-success response reserved for a genuinely stale session."""
+    _override_generous_rate_limiter(app)
+    _login(client, auth_tenancy.owner_user.normalized_email, auth_tenancy.owner_password)
+
+    with patch(
+        "app.core.session_dependency.SessionService.validate_session",
+        side_effect=ConflictError("simulated unrelated service error"),
+    ):
+        response = client.post(LOGOUT_URL, headers=_csrf_headers(client))
+
+    assert response.status_code == 409
+    assert _cookie_clear_header(response, SESSION_COOKIE_NAME) is None
+    assert _cookie_clear_header(response, CSRF_COOKIE_NAME) is None
 
 
 def test_logout_stale_cookie_ignores_dev_headers(client, auth_tenancy):
