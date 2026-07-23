@@ -94,7 +94,11 @@ $authTestCoverageHints = @(
     "tests/integration/test_auth_password_reset_api.py",
     "tests/integration/test_auth_invitation_api.py",
     "tests/integration/test_auth_dev_identity_api.py",
-    "tests/integration/auth_api_helpers.py"
+    "tests/integration/auth_api_helpers.py",
+    "tests/integration/conftest.py",
+    "tests/integration/test_password_reset_service.py",
+    "tests/integration/test_session_service.py",
+    "tests/integration/test_invitation_service.py"
 )
 
 # Top-level directories whose untracked/changed files are always candidates
@@ -682,10 +686,21 @@ $schemaPath       = Join-Path $root ".ai-workflow\prompts\review-output-schema.j
 # Size handling: drop lowest-priority (highest Tier number) sections first,
 # largest-first within a tier, until under budget. Never truncate a
 # section's content - only drop it whole, and record it as omitted.
-# 900,000 chars is a conservative budget well under typical large-context
+# 1,300,000 chars is a conservative budget well under typical large-context
 # model limits while leaving headroom for the prompt/schema/instructions.
+# Raised from 900,000 (MED-004 repair): on a clean tree the diff is always
+# taken against the merge-base with master (see the diff-baseline comment
+# near the top of this file), so a long-running feature branch with many
+# repair commits keeps accreting legitimate review-relevant diff content
+# round over round - splitting the one largest file (done for
+# test_auth_api.py, see $authTestCoverageHints) stops that specific file
+# from being the casualty, but does not stop the same size pressure from
+# dropping a DIFFERENT file next round. Once the budget was no longer
+# comfortably above the real size of a normal, non-bloated review packet
+# for this branch, raising it was the right call over further hint-pinning
+# individual files one at a time.
 # ---------------------------------------------------------------------------
-$MaxPacketChars = 900000
+$MaxPacketChars = 1300000
 $sections = $packet.Sections
 
 function Get-TotalChars {
