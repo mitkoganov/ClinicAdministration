@@ -155,6 +155,35 @@ def test_me_returns_safe_identity_fields(client, app, auth_tenancy):
     assert "session_token" not in body
 
 
+def test_me_never_reports_an_expiry_later_than_the_absolute_cap(
+    client, app, auth_tenancy, db_session
+):
+    """MED-004 repair (finding 3): even a legacy/inconsistent row where
+    idle_expires_at is later than absolute_expires_at must never leak
+    outward - GET /auth/me always reports the effective (earlier) one."""
+    _override_generous_rate_limiter(app)
+    _login(client, auth_tenancy.owner_user.normalized_email, auth_tenancy.owner_password)
+
+    absolute_cap = datetime.now(UTC) + timedelta(minutes=5)
+    db_session.execute(
+        text(
+            "UPDATE auth_sessions SET absolute_expires_at = :absolute_cap, "
+            "idle_expires_at = :idle_expires_at WHERE user_id = :user_id"
+        ),
+        {
+            "absolute_cap": absolute_cap,
+            "idle_expires_at": absolute_cap + timedelta(hours=1),
+            "user_id": str(auth_tenancy.owner_user.id),
+        },
+    )
+    db_session.flush()
+
+    response = client.get(ME_URL)
+    assert response.status_code == 200
+    reported_expiry = datetime.fromisoformat(response.json()["session_expires_at"])
+    assert reported_expiry <= absolute_cap
+
+
 def test_me_without_a_session_is_unauthorized(client):
     response = client.get(ME_URL)
     assert response.status_code == 401

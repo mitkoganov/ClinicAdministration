@@ -146,10 +146,24 @@ present.
 5. Password reset (`/forgot-password`, `/reset-password`) and invitation
    acceptance (`/invitations/accept`) issue and validate tokens
    server-side, but **no email is sent** — there is no delivery mechanism
-   in this foundation stage. To test either flow locally, read the raw
-   token directly from the `one_time_tokens` table (or a debug log line
-   you add temporarily and remove before committing) and build the URL by
-   hand, e.g. `http://localhost:3000/reset-password?token=<raw token>`.
+   in this foundation stage. The `one_time_tokens` table only ever stores
+   a SHA-256 **hash** of the token (see `SECURITY.md` — a raw token is
+   never persisted, so it cannot be recovered from the database, and it
+   must never be logged either). The only place the raw token exists is
+   the return value of `PasswordResetService.request_reset` /
+   `InvitationService.create_invitation` at the moment of creation — the
+   production API routes deliberately discard it. To exercise either
+   flow locally:
+   - preferred: see the automated coverage in
+     `backend/tests/integration/test_password_reset_service.py` and
+     `test_invitation_service.py`, which call these methods directly and
+     use the returned raw token exactly as a real client would;
+   - for manual exploration, call the same service method from a local
+     Python shell (`.venv\Scripts\python`) against your dev database,
+     capture the returned string in that shell session only, and build
+     the URL by hand, e.g.
+     `http://localhost:3000/reset-password?token=<raw token>` — never
+     print/log it, and never commit anything that does.
 
 ## Running tests
 

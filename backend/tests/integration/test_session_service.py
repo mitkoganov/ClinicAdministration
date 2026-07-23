@@ -7,13 +7,13 @@ from sqlalchemy import text
 
 from app.core.audit import AuditOutcome
 from app.core.config import Settings
-from app.core.errors import NotFoundError, UnauthorizedError
+from app.core.errors import InvalidSessionError, NotFoundError, UnauthorizedError
 from app.models.membership import MembershipRole
 from app.models.tenant import Tenant, TenantStatus
 from app.models.user_account import UserAccountStatus
 from app.repositories.auth_session import AuthSessionRepository
 from app.repositories.membership import MembershipRepository
-from app.services.session_service import TOUCH_THRESHOLD, SessionService
+from app.services.session_service import TOUCH_THRESHOLD, SessionService, effective_session_expiry
 
 # Every test in this module uses db_session/auth_tenancy - a real
 # disposable Postgres test database.
@@ -240,6 +240,103 @@ def test_validate_session_fails_closed_when_touch_commit_fails(db_session, auth_
         service.validate_session(created.raw_token)
 
     assert rollback_spy.call_count == 1
+
+
+def test_touch_clamps_refreshed_idle_expiry_to_the_absolute_cap(db_session, auth_tenancy):
+    """MED-004 repair (finding 3): a touch near the end of a session's
+    absolute lifetime must never push idle_expires_at past
+    absolute_expires_at - the absolute lifetime is a hard ceiling
+    regardless of activity, and an unclamped touch would otherwise create
+    a timestamp inversion (idle later than absolute)."""
+    service = SessionService(db_session, _settings())
+    created = service.create_session(auth_tenancy.owner_user)
+    now = datetime.now(UTC)
+    near_absolute_cap = now + timedelta(minutes=10)
+    created.session.absolute_expires_at = near_absolute_cap
+    created.session.last_seen_at = now - TOUCH_THRESHOLD - timedelta(minutes=1)
+    db_session.commit()
+
+    validated = service.validate_session(created.raw_token)
+
+    # session_idle_lifetime_hours defaults to 24h - without the clamp,
+    # idle_expires_at would land ~24h from now, far past near_absolute_cap.
+    assert validated.session.idle_expires_at == near_absolute_cap
+    assert validated.session.idle_expires_at <= validated.session.absolute_expires_at
+
+
+def test_touch_does_not_clamp_when_absolute_expiry_is_far_away(db_session, auth_tenancy):
+    """Regression guard: the ordinary case (absolute expiry far in the
+    future) must still refresh idle_expires_at to the normal
+    now + idle_lifetime value, not always to the absolute cap."""
+    service = SessionService(db_session, _settings())
+    created = service.create_session(auth_tenancy.owner_user)
+    original_absolute_expires_at = created.session.absolute_expires_at
+    stale_last_seen = datetime.now(UTC) - TOUCH_THRESHOLD - timedelta(minutes=1)
+    created.session.last_seen_at = stale_last_seen
+    db_session.commit()
+
+    validated = service.validate_session(created.raw_token)
+
+    assert validated.session.idle_expires_at < original_absolute_expires_at
+    assert validated.session.absolute_expires_at == original_absolute_expires_at
+
+
+def test_touch_persists_the_clamped_idle_expiry(db_session, auth_tenancy):
+    """The clamp must survive the commit, not just be visible in-memory on
+    the object touch() already mutated - reload from the database to
+    prove it was actually persisted, the same proof pattern used for
+    finding 2's commit fix."""
+    service = SessionService(db_session, _settings())
+    created = service.create_session(auth_tenancy.owner_user)
+    now = datetime.now(UTC)
+    near_absolute_cap = now + timedelta(minutes=10)
+    created.session.absolute_expires_at = near_absolute_cap
+    created.session.last_seen_at = now - TOUCH_THRESHOLD - timedelta(minutes=1)
+    db_session.commit()
+
+    service.validate_session(created.raw_token)
+
+    db_session.expire_all()
+    reloaded = AuthSessionRepository(db_session).get_by_token_hash(
+        created.session.session_token_hash
+    )
+    assert reloaded is not None
+    assert reloaded.idle_expires_at == near_absolute_cap
+
+
+def test_validate_session_rejects_after_absolute_expiry_even_if_idle_would_allow_it(
+    db_session, auth_tenancy
+):
+    """Absolute expiry always wins, regardless of what idle_expires_at
+    says - a session must never be extended past its absolute lifetime by
+    any code path, including an inconsistent row where idle is later."""
+    service = SessionService(db_session, _settings())
+    created = service.create_session(auth_tenancy.owner_user)
+    now = datetime.now(UTC)
+    created.session.absolute_expires_at = now - timedelta(seconds=1)
+    created.session.idle_expires_at = now + timedelta(hours=1)
+    db_session.commit()
+
+    with pytest.raises(InvalidSessionError):
+        service.validate_session(created.raw_token)
+
+
+def test_effective_session_expiry_returns_the_earlier_timestamp(db_session, auth_tenancy):
+    """Direct unit-level proof of the helper `/auth/me` relies on: even
+    for a legacy/inconsistent row where idle_expires_at is later than
+    absolute_expires_at, the effective expiry reported outward must be
+    the earlier (absolute) one."""
+    service = SessionService(db_session, _settings())
+    created = service.create_session(auth_tenancy.owner_user)
+    now = datetime.now(UTC)
+
+    created.session.idle_expires_at = now + timedelta(hours=1)
+    created.session.absolute_expires_at = now + timedelta(minutes=1)
+    assert effective_session_expiry(created.session) == created.session.absolute_expires_at
+
+    created.session.idle_expires_at = now + timedelta(minutes=1)
+    created.session.absolute_expires_at = now + timedelta(hours=1)
+    assert effective_session_expiry(created.session) == created.session.idle_expires_at
 
 
 def test_select_clinic_emits_success_audit_after_commit(db_session, auth_tenancy):

@@ -452,11 +452,12 @@ handing a conversation to a human operator without losing context.
   identity provider.
 * `frontend/` — Next.js App Router shell with a landing page that displays
   backend health status, `/login`, `/forgot-password`, `/reset-password`,
-  and `/invitations/accept` for the new authentication flow, plus
-  `/settings/clinic` and `/settings/staff` — now session-authenticated
-  (`app/lib/api.ts`), with the development identity picker retained
-  as a local-testing convenience only and never rendered in a production
-  build.
+  `/select-clinic`, and `/invitations/accept` for the authentication flow,
+  plus `/settings/clinic`, `/settings/staff`, and `/settings/security`
+  (authenticated change-password) — all session-authenticated
+  (`app/lib/api.ts`), with the development identity picker (and its
+  `/dev/identity` entry point) retained as a local-testing convenience
+  only and never rendered/reachable in a production build.
 * `infra/` — Docker Compose definitions for Postgres, Redis, Qdrant, backend,
   frontend.
 

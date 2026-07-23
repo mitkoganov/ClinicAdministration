@@ -10,6 +10,7 @@ export default function SettingsLayout({ children }: Readonly<{ children: React.
       <nav style={{ display: "flex", gap: "1rem", marginBottom: "1rem" }}>
         <Link href="/settings/clinic">Clinic settings</Link>
         <Link href="/settings/staff">Staff</Link>
+        <Link href="/settings/security">Security</Link>
       </nav>
       <IdentityBanner />
       {children}

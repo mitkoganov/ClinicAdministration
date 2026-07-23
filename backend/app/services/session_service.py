@@ -33,6 +33,18 @@ from app.repositories.user_account import UserAccountRepository
 TOUCH_THRESHOLD = timedelta(minutes=5)
 
 
+def effective_session_expiry(session: AuthSession) -> datetime:
+    """The real remaining lifetime of a session - never later than the
+    absolute cap, regardless of what `idle_expires_at` happens to say. The
+    touch logic below always clamps a *refreshed* idle expiry to the
+    absolute cap, but this is still the single place any caller (e.g.
+    `GET /auth/me`) should read an outward-facing expiry from, so a
+    pre-existing inconsistent row (or an unusually configured idle
+    lifetime longer than the absolute one) can never report an expiry the
+    session cannot actually reach."""
+    return min(session.idle_expires_at, session.absolute_expires_at)
+
+
 @dataclass(frozen=True)
 class CreatedSession:
     session: AuthSession
@@ -106,9 +118,18 @@ class SessionService:
             raise InvalidSessionError()
 
         if now - session.last_seen_at >= TOUCH_THRESHOLD:
-            self._sessions.touch(
-                session, now, now + timedelta(hours=self._settings.session_idle_lifetime_hours)
+            # Never refresh idle expiry past the session's own absolute
+            # cap - the absolute lifetime is a hard ceiling regardless of
+            # activity (see the module docstring), and an unclamped touch
+            # could otherwise push idle_expires_at later than
+            # absolute_expires_at, which both misrepresents the session's
+            # real remaining lifetime to callers of /auth/me and would be
+            # a timestamp inversion at rest.
+            refreshed_idle_expires_at = min(
+                now + timedelta(hours=self._settings.session_idle_lifetime_hours),
+                session.absolute_expires_at,
             )
+            self._sessions.touch(session, now, refreshed_idle_expires_at)
             # The idle-refresh write must actually reach the database - a
             # bare flush is only visible within this request's own
             # transaction and is discarded (never committed) once the

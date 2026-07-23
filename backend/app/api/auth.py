@@ -26,7 +26,7 @@ from app.schemas.auth import (
 from app.services.auth_service import AuthService
 from app.services.invitation_service import InvitationService
 from app.services.password_reset_service import PasswordResetService
-from app.services.session_service import SessionService, ValidatedSession
+from app.services.session_service import SessionService, ValidatedSession, effective_session_expiry
 
 router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
 
@@ -102,7 +102,7 @@ def me(
         display_name=validated.user.display_name,
         selected_clinic=selected_clinic,
         role=role,
-        session_expires_at=validated.session.idle_expires_at,
+        session_expires_at=effective_session_expiry(validated.session),
     )
 
 
