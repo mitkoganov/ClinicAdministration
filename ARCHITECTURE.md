@@ -277,11 +277,19 @@ default `true` — see "Cookie security fail-closed" below).
   expired-either-way session is treated as no session at all, not
   silently extended).
 * **Login** (`POST /api/v1/auth/login`) issues a new session + CSRF token
-  pair. **Logout** (`POST /api/v1/auth/logout`) is idempotent — a
-  missing/already-invalid session still clears cookies and returns
-  success, never revealing which condition applied — and revokes the
-  session server-side (`revoked_at`), not just client-side cookie
-  clearing.
+  pair. **Logout** (`POST /api/v1/auth/logout`) is idempotent for every
+  "no usable session" condition — missing, unknown, expired, revoked, or
+  an inactive-account session cookie all clear both cookies and return
+  success, never revealing which one applied. It deliberately does not
+  use the shared `require_csrf` dependency (that would 401 a stale
+  cookie instead of the idempotent success above — see
+  `app.core.session_dependency.get_current_session_or_none_if_stale`);
+  CSRF is still required, via the same comparison
+  (`app.core.csrf.enforce_csrf_for_valid_session`), whenever there IS a
+  genuinely valid session — a missing/invalid CSRF token there is a
+  controlled 403 that revokes nothing and clears nothing. A valid
+  session's own revocation is server-side (`revoked_at`), not just
+  client-side cookie clearing.
 * **Clinic selection** (`POST /api/v1/auth/select-clinic`) re-validates
   that the caller has an active membership in the requested tenant before
   storing `selected_tenant_id` on the session row — the same
@@ -326,9 +334,13 @@ the CSRF token issued at login; the client must echo the raw token via the
 double-submit. `require_csrf` is a no-op for safe methods and for requests
 with no valid session (the route's own auth dependency independently
 rejects unauthenticated callers regardless) — applied to
-`logout`/`select-clinic`/`change-password` and to the MED-003 mutating
+`select-clinic`/`change-password` and to the MED-003 mutating
 clinic/staff routes, not to `login`/`password-reset`/`invitation-accept`,
-which have no session yet to tie a token to.
+which have no session yet to tie a token to. `logout` enforces the exact
+same comparison via `enforce_csrf_for_valid_session` directly rather than
+the `require_csrf` dependency, since it must stay idempotent for a stale
+session cookie instead of 401ing it (see "Session lifecycle and cookies"
+above).
 
 ### Login rate limiting
 
@@ -389,7 +401,7 @@ All under `/api/v1/auth` (`backend/app/api/auth.py`):
 | Method & path | Session required | CSRF | Purpose |
 |---|---|---|---|
 | `POST /login` | no | no | Issue session + CSRF cookies |
-| `POST /logout` | optional | yes | Idempotent session revocation |
+| `POST /logout` | optional | only if session valid | Idempotent session revocation |
 | `GET /me` | yes | — | Current user + selected clinic (role re-resolved live) |
 | `GET /clinics` | yes | — | All active clinic memberships for the caller |
 | `POST /select-clinic` | yes | yes | Set `selected_tenant_id` on the session |

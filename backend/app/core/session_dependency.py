@@ -68,3 +68,30 @@ def get_current_session_optional(
         raise
     except UnauthorizedError:
         return None
+
+
+def get_current_session_or_none_if_stale(
+    request: Request,
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> ValidatedSession | None:
+    """Logout-only variant of `get_current_session_optional`: a stale
+    session cookie (`InvalidSessionError` - unknown, revoked, expired, or
+    an inactive-account session) is treated the same as no session at
+    all, rather than propagating to the shared stale-cookie 401 handler.
+
+    This exists ONLY for `POST /auth/logout`, which must stay idempotent
+    for a caller who has no *usable* session to revoke - clearing cookies
+    and returning success regardless of which unusable-session condition
+    applied, never leaking that distinction outward. Every other caller
+    must keep using `get_current_session_optional` (which re-raises
+    `InvalidSessionError`) so tenant-scoped routes, CSRF checks on other
+    mutations, and every other 401 path still clear stale cookies via the
+    dedicated handler instead of silently treating them as absent."""
+    raw_token = _extract_session_token(request)
+    if not raw_token:
+        return None
+    try:
+        return SessionService(db, settings).validate_session(raw_token)
+    except UnauthorizedError:
+        return None

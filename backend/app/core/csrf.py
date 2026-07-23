@@ -31,6 +31,23 @@ CSRF_HEADER_NAME = "X-CSRF-Token"
 _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
 
+def enforce_csrf_for_valid_session(request: Request, validated: ValidatedSession) -> None:
+    """The actual double-submit comparison, factored out of `require_csrf`
+    so a caller that already resolved its own session through a
+    different (but equally valid) path can still enforce the exact same
+    CSRF check without duplicating the comparison logic. Used by
+    `require_csrf` below, and by `POST /auth/logout`'s logout-specific
+    session resolution (see app.core.session_dependency.
+    get_current_session_or_none_if_stale) - logout must still require a
+    valid CSRF token before revoking a genuinely valid session, even
+    though it resolves that session without going through
+    `get_current_session_optional`. Never call this with a `None`
+    session - CSRF simply does not apply then (see `require_csrf`)."""
+    header_value = request.headers.get(CSRF_HEADER_NAME)
+    if not header_value or not tokens_match(header_value, validated.session.csrf_token_hash):
+        raise AppError("Missing or invalid CSRF token.", status_code=403)
+
+
 def require_csrf(
     request: Request,
     validated: ValidatedSession | None = Depends(get_current_session_optional),
@@ -46,7 +63,4 @@ def require_csrf(
         return
     if validated is None:
         return
-
-    header_value = request.headers.get(CSRF_HEADER_NAME)
-    if not header_value or not tokens_match(header_value, validated.session.csrf_token_hash):
-        raise AppError("Missing or invalid CSRF token.", status_code=403)
+    enforce_csrf_for_valid_session(request, validated)
