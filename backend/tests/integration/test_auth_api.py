@@ -545,6 +545,54 @@ def test_invitation_accept_rejects_an_existing_inactive_account(client, auth_ten
     assert "account" not in response.json()["detail"].lower()
 
 
+def test_invitation_accept_cannot_take_over_an_existing_active_account(
+    client, app, auth_tenancy, db_session
+):
+    """MED-004 repair (account-takeover finding): accepting an invitation
+    whose invitee_email matches an existing ACTIVE account must never
+    change that account's password or issue it a session, regardless of
+    who obtained the invitation link. This is the core end-to-end
+    regression test for the account-takeover vulnerability."""
+    from app.models.membership import MembershipRole
+    from app.services.invitation_service import InvitationService
+
+    _override_generous_rate_limiter(app)
+    settings = Settings(environment="development", session_cookie_secure=False)
+    raw_token = InvitationService(db_session, settings).create_invitation(
+        auth_tenancy.tenant_b.id,
+        MembershipRole.OPERATOR,
+        auth_tenancy.owner_user.normalized_email,
+        auth_tenancy.owner_user.id,
+    )
+
+    response = client.post(
+        "/api/v1/auth/invitations/accept",
+        json={
+            "token": raw_token,
+            "display_name": "Attacker Chosen Name",
+            "password": "attacker chosen new password!!",
+        },
+    )
+
+    assert response.status_code == 400
+    assert SESSION_COOKIE_NAME not in client.cookies
+    assert "csrf_token" not in client.cookies
+    assert "account" not in response.json()["detail"].lower()
+
+    # The account's real password must still work, and the attacker's
+    # chosen password must not.
+    login_with_old_password = _login(
+        client, auth_tenancy.owner_user.normalized_email, auth_tenancy.owner_password
+    )
+    assert login_with_old_password.status_code == 200
+    client.post(LOGOUT_URL, headers=_csrf_headers(client))
+
+    login_with_attacker_password = _login(
+        client, auth_tenancy.owner_user.normalized_email, "attacker chosen new password!!"
+    )
+    assert login_with_attacker_password.status_code == 401
+
+
 def test_invitation_accept_rejects_extra_fields_attempting_to_override_tenant_or_role(client):
     response = client.post(
         "/api/v1/auth/invitations/accept",

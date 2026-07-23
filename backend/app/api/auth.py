@@ -177,10 +177,12 @@ def accept_invitation(
     db: Session = Depends(get_db),
     settings: Settings = Depends(get_settings),
 ) -> StatusResponse:
-    user = InvitationService(db, settings).accept_invitation(
-        payload.token, payload.display_name, payload.password
+    # InvitationService.accept_invitation owns the single commit for the
+    # whole attempt (account, membership, session, token consumption) -
+    # this route performs no commit of its own, and only sets cookies once
+    # that commit has actually succeeded.
+    result = InvitationService(db, settings).accept_invitation(
+        payload.token, payload.display_name, payload.password, SessionService(db, settings)
     )
-    created = SessionService(db, settings).create_session(user)
-    db.commit()
-    set_session_cookies(response, created.raw_token, created.raw_csrf_token, settings)
+    set_session_cookies(response, result.session.raw_token, result.session.raw_csrf_token, settings)
     return StatusResponse()
