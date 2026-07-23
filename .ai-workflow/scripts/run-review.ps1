@@ -75,6 +75,28 @@ $securityCriticalHints = @(
     "core/config.py", "core/errors.py", "core/background_context.py", "core/audit.py"
 )
 
+# The auth API integration-test suite (split from a single large
+# test_auth_api.py specifically because that file, at ~1200 lines, was
+# large enough to be dropped by the size-budget logic below - see
+# Build-ReviewPacket's droppable-sections pass). These are the primary
+# end-to-end evidence for MED-004 auth behavior (login/logout, cookies,
+# CSRF, clinic selection, stale-session handling); Codex has twice
+# reported REVIEW_INCOMPLETE when this coverage was silently omitted, so
+# every file here is pinned to Tier 1 (never dropped) rather than left to
+# compete with other Tier 3 sections on size.
+$authTestCoverageHints = @(
+    "tests/integration/test_auth_login_logout_api.py",
+    "tests/integration/test_auth_session_api.py",
+    "tests/integration/test_auth_tenant_route_stale_cookie_api.py",
+    "tests/integration/test_auth_clinic_selection_api.py",
+    "tests/integration/test_auth_csrf_api.py",
+    "tests/integration/test_auth_password_change_api.py",
+    "tests/integration/test_auth_password_reset_api.py",
+    "tests/integration/test_auth_invitation_api.py",
+    "tests/integration/test_auth_dev_identity_api.py",
+    "tests/integration/auth_api_helpers.py"
+)
+
 # Top-level directories whose untracked/changed files are always candidates
 # for full-content review.
 $includedTopLevelDirs = @("backend", "frontend", ".ai-workflow", ".vscode")
@@ -293,7 +315,7 @@ function Build-ReviewPacket {
         $fullPath = Join-Path $RepoRoot $relNorm
         $content = Get-Content -Raw -Encoding utf8 -Path $fullPath
         $tier = 3
-        foreach ($hint in $securityCriticalHints) {
+        foreach ($hint in ($securityCriticalHints + $authTestCoverageHints)) {
             if ($relNorm.EndsWith($hint)) { $tier = 1; break }
         }
         Add-Section -Title "Untracked file: $relNorm" -RelPath $relNorm `
@@ -348,7 +370,7 @@ function Build-ReviewPacket {
 
             $content = Get-Content -Raw -Encoding utf8 -Path $fullPath
             $tier = 3
-            foreach ($hint in $securityCriticalHints) {
+            foreach ($hint in ($securityCriticalHints + $authTestCoverageHints)) {
                 if ($newRel.EndsWith($hint)) { $tier = 1; break }
             }
             Add-Section -Title "Tracked $kind file (full current content): $oldRel -> $newRel ($statusCode)" -RelPath $newRel `
@@ -396,7 +418,7 @@ function Build-ReviewPacket {
 
         $content = Get-Content -Raw -Encoding utf8 -Path $fullPath
         $tier = 3
-        foreach ($hint in $securityCriticalHints) {
+        foreach ($hint in ($securityCriticalHints + $authTestCoverageHints)) {
             if ($relNorm.EndsWith($hint)) { $tier = 1; break }
         }
         Add-Section -Title "Tracked changed file ($statusCode, full current content - staged+unstaged combined): $relNorm" -RelPath $relNorm `

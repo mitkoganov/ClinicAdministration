@@ -37,6 +37,69 @@ def test_request_reset_for_inactive_account_returns_none(db_session, auth_tenanc
     assert service.request_reset(auth_tenancy.inactive_account_user.normalized_email) is None
 
 
+def test_request_reset_for_unknown_account_emits_a_rejected_audit_with_no_actor(
+    db_session, auth_tenancy
+):
+    """MED-004 repair: an unknown-account reset request must still be
+    audited - just with no identifying actor and no raw email - so a
+    flood of requests against nonexistent accounts is visible without
+    the audit trail itself leaking account existence."""
+    service = PasswordResetService(db_session, _settings())
+    unknown_email = f"nonexistent-{uuid.uuid4()}@auth.test"
+
+    with patch("app.services.password_reset_service.emit_audit_event") as mock_emit_audit_event:
+        assert service.request_reset(unknown_email) is None
+
+    assert mock_emit_audit_event.call_count == 1
+    event = mock_emit_audit_event.call_args_list[0].args[0]
+    assert event.event_type == "auth.password_reset_requested"
+    assert event.outcome == AuditOutcome.REJECTED
+    assert event.actor_user_id is None
+    assert unknown_email not in str(event.to_dict())
+
+
+def test_request_reset_for_inactive_account_emits_a_rejected_audit_with_no_actor(
+    db_session, auth_tenancy
+):
+    service = PasswordResetService(db_session, _settings())
+
+    with patch("app.services.password_reset_service.emit_audit_event") as mock_emit_audit_event:
+        assert service.request_reset(auth_tenancy.inactive_account_user.normalized_email) is None
+
+    assert mock_emit_audit_event.call_count == 1
+    event = mock_emit_audit_event.call_args_list[0].args[0]
+    assert event.event_type == "auth.password_reset_requested"
+    assert event.outcome == AuditOutcome.REJECTED
+    assert event.actor_user_id is None
+    assert auth_tenancy.inactive_account_user.normalized_email not in str(event.to_dict())
+
+
+def test_request_reset_for_unknown_account_creates_no_token(db_session, auth_tenancy):
+    unknown_email = f"nonexistent-{uuid.uuid4()}@auth.test"
+    before_count = db_session.execute(text("SELECT count(*) FROM one_time_tokens")).scalar_one()
+
+    PasswordResetService(db_session, _settings()).request_reset(unknown_email)
+
+    after_count = db_session.execute(text("SELECT count(*) FROM one_time_tokens")).scalar_one()
+    assert after_count == before_count
+
+
+def test_request_reset_for_known_account_emits_a_success_audit_for_that_user(
+    db_session, auth_tenancy
+):
+    service = PasswordResetService(db_session, _settings())
+
+    with patch("app.services.password_reset_service.emit_audit_event") as mock_emit_audit_event:
+        token = service.request_reset(auth_tenancy.owner_user.normalized_email)
+
+    assert token is not None
+    assert mock_emit_audit_event.call_count == 1
+    event = mock_emit_audit_event.call_args_list[0].args[0]
+    assert event.event_type == "auth.password_reset_requested"
+    assert event.outcome == AuditOutcome.SUCCESS
+    assert event.actor_user_id == auth_tenancy.owner_user.id
+
+
 def test_request_reset_for_known_account_returns_a_token(db_session, auth_tenancy):
     service = PasswordResetService(db_session, _settings())
     token = service.request_reset(auth_tenancy.owner_user.normalized_email)

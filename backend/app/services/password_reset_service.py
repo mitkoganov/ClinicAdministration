@@ -38,8 +38,13 @@ class PasswordResetService:
         normalized = normalize_email(email)
         user = self._users.get_by_normalized_email(normalized)
         if user is None or user.status != UserAccountStatus.ACTIVE:
-            # No token, no audit actor, no error - the caller (API layer)
-            # returns the exact same neutral response either way.
+            # No token, no DB mutation, no error - the caller (API layer)
+            # returns the exact same neutral response either way. Still
+            # audited, with no identifying actor and no raw email, so a
+            # flood of reset requests against unknown/disabled accounts
+            # stays visible without letting the audit trail itself leak
+            # which case applied.
+            self._audit(None, "auth.password_reset_requested", AuditOutcome.REJECTED)
             return None
 
         raw_token = generate_token()
@@ -98,7 +103,7 @@ class PasswordResetService:
             raise
         self._audit(user.id, "auth.password_reset_completed", AuditOutcome.SUCCESS)
 
-    def _audit(self, user_id: uuid.UUID, event_type: str, outcome: AuditOutcome) -> None:
+    def _audit(self, user_id: uuid.UUID | None, event_type: str, outcome: AuditOutcome) -> None:
         emit_audit_event(
             AuditEvent(
                 event_type=event_type,
