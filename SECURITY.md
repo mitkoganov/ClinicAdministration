@@ -142,11 +142,14 @@ begins.
   update (`SessionService.revoke_all_for_user`).
 * **Threat: dev-identity header used to bypass or shadow a real session.**
   **Mitigation:** `get_tenant_context` always resolves a real session
-  first; a dev header is only ever consulted when no valid session
-  exists, and can never override one — see `ARCHITECTURE.md` →
-  "Dev-identity isolation". Covered by a dedicated integration test
+  first; a dev header is only ever consulted when **no session cookie was
+  sent at all** — a cookie that was sent but is invalid, expired, revoked,
+  or belongs to a now-inactive account is never treated as absent, and
+  never falls back to dev headers either (see `ARCHITECTURE.md` →
+  "Dev-identity isolation"). Covered by dedicated integration tests
   asserting a dev header is ignored whenever a valid session cookie is
-  also present.
+  present, and separately that an *invalid* session cookie still 401s
+  with cookie clearing even when valid dev headers are also sent.
 * **Threat: insecure session cookie reaching a production-like
   environment.** **Mitigation:** `Settings._validate_cookie_security`
   refuses to start if `session_cookie_secure=False` outside
@@ -166,6 +169,14 @@ begins.
   granted.
 * It is covered by tests, including the case where it is disabled and
   headers are supplied anyway (must still reject).
+* The frontend entry point for configuring a development identity,
+  `/dev/identity`, returns a real, server-enforced HTTP 404 in any
+  non-development build (a Next.js Server Component calling `notFound()`
+  — see `ARCHITECTURE.md` → "Dev-identity isolation") — not merely a
+  page that renders a "not found" message at status 200. Neither
+  `localStorage` nor a query parameter can make it reachable in a
+  production build; the gate runs entirely server-side before any
+  selector UI would be sent to the browser.
 
 ## Fail-closed background operations
 

@@ -50,9 +50,13 @@ def get_tenant_context(
     never even consulted - a caller cannot use dev headers to override an
     already-authenticated production session (see task.md "dev headers
     да не могат да override-нат production session"). The development
-    path is only ever reached when there is no session cookie at all (or
-    it is invalid/expired), and even then only if
-    `DEVELOPMENT_IDENTITY_ENABLED=true`."""
+    path is only ever reached when there is no session cookie **at all**
+    - never when one was sent but turned out invalid/expired/revoked:
+    `get_current_session_optional` re-raises `InvalidSessionError` for
+    that case instead of returning `None`, so a stale/forged production
+    cookie propagates straight to the 401 + cookie-clearing response
+    below and never silently falls back to dev headers. Development
+    fallback additionally requires `DEVELOPMENT_IDENTITY_ENABLED=true`."""
     # Deferred import: app.services.tenant_service imports TenantContext from
     # this module, so importing it at module scope here would be circular.
     from app.services.tenant_service import resolve_tenant_context

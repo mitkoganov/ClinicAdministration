@@ -354,10 +354,25 @@ get_tenant_context` resolves a real session first — by calling
 `get_current_session_optional` directly inside the function body, not via
 a stacked `Depends` (FastAPI dependencies have no native "try A, fallback
 B" composition) — and only falls back to `X-Dev-User-Id`/`X-Tenant-Id`
-headers when no valid session exists. **A valid session always wins**; a
-dev header can never override or shadow one. This makes every existing
-MED-002/MED-003 tenant-scoped route session-aware automatically, without
-editing those route files.
+headers when there is **no session cookie at all**. A session cookie that
+was actually sent but turned out invalid/expired/revoked (or belongs to a
+now-inactive account) never falls back either: `get_current_session_
+optional` re-raises `InvalidSessionError` for that case instead of
+returning `None` (see `app.core.session_dependency`), so it reaches the
+same 401 + cookie-clearing response as any other stale-session request
+and dev headers are never even consulted. **A valid session always
+wins, and an invalid one is never treated as absent.** This makes every
+existing MED-002/MED-003 tenant-scoped route session-aware automatically,
+without editing those route files.
+
+The frontend's own development-identity entry point, `/dev/identity`
+(`frontend/app/dev/identity/page.tsx`), is a Server Component that calls
+Next's `notFound()` outside a development build — an actual HTTP 404 for
+every production request, never a client component quietly rendering a
+"not found" message at status 200. The selector UI itself lives in a
+separate client component (`dev-identity-page-client.tsx`) the server
+page never renders in production, so neither a crafted `localStorage`
+value nor a query parameter can reach it.
 
 ### Cookie security fail-closed
 

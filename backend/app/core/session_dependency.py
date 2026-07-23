@@ -8,7 +8,7 @@ from fastapi import Depends, Request
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings, get_settings
-from app.core.errors import UnauthorizedError
+from app.core.errors import InvalidSessionError, UnauthorizedError
 from app.db.session import get_db
 from app.services.session_service import SessionService, ValidatedSession
 
@@ -41,14 +41,30 @@ def get_current_session_optional(
     settings: Settings = Depends(get_settings),
 ) -> ValidatedSession | None:
     """Same validation as `get_current_session`, but returns `None`
-    instead of raising when there is no valid session - used where an
-    absent session is a normal, expected case: CSRF checking (which only
-    applies to cookie-authenticated requests) and the combined
-    session/dev-identity tenant-context resolution."""
+    instead of raising when there is genuinely no session to consider -
+    used where an absent session is a normal, expected case: CSRF
+    checking (which only applies to cookie-authenticated requests) and
+    the combined session/dev-identity tenant-context resolution.
+
+    "Optional" only ever means "no session cookie was sent" - it must
+    never also mean "a session cookie was sent but turned out invalid".
+    `InvalidSessionError` (a subclass of `UnauthorizedError`, raised by
+    `validate_session` for every unknown/revoked/expired/inactive-account
+    case) is deliberately re-raised, not swallowed, so a stale cookie
+    still reaches the dedicated cookie-clearing exception handler (see
+    app.core.session_cookies) and still blocks the dev-identity fallback
+    in `get_tenant_context` - an attacker-controlled or merely-stale
+    production cookie must never be treated as if it were absent. Only
+    the narrower, non-session-specific `UnauthorizedError` that
+    `validate_session` raises for a touch-commit failure (a transient
+    infrastructure problem, not a statement about the cookie's validity)
+    is still treated as "no session" here."""
     raw_token = _extract_session_token(request)
     if not raw_token:
         return None
     try:
         return SessionService(db, settings).validate_session(raw_token)
+    except InvalidSessionError:
+        raise
     except UnauthorizedError:
         return None
