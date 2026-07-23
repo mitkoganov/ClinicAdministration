@@ -43,11 +43,19 @@ class PasswordResetService:
             return None
 
         raw_token = generate_token()
-        expires_at = datetime.now(UTC) + timedelta(
-            minutes=self._settings.password_reset_token_lifetime_minutes
-        )
-        self._tokens.create_password_reset(user.id, hash_token(raw_token), expires_at)
-        self._db.commit()
+        now = datetime.now(UTC)
+        expires_at = now + timedelta(minutes=self._settings.password_reset_token_lifetime_minutes)
+        try:
+            # An older outstanding reset link must stop working the
+            # moment a new one is issued - only the most recently
+            # requested token should ever be usable, so a stale link
+            # leaked or forgotten in an inbox can't be replayed later.
+            self._tokens.revoke_all_password_reset_for_user(user.id, now)
+            self._tokens.create_password_reset(user.id, hash_token(raw_token), expires_at)
+            self._db.commit()
+        except Exception:
+            self._db.rollback()
+            raise
         self._audit(user.id, "auth.password_reset_requested", AuditOutcome.SUCCESS)
         return raw_token
 
@@ -72,10 +80,22 @@ class PasswordResetService:
         except InvalidPasswordError as exc:
             raise WeakPasswordError(str(exc)) from exc
 
-        self._users.update_password_hash(user, new_hash, now)
-        self._tokens.consume(token, now)
-        self._sessions.revoke_all_for_user(user.id, "password_reset")
-        self._db.commit()
+        try:
+            self._users.update_password_hash(user, new_hash, now)
+            self._tokens.consume(token, now)
+            # Every OTHER outstanding password-reset token for this
+            # account must die with this one - consume() above already
+            # marked the submitted token consumed, so this call's own
+            # `consumed_at IS NULL` filter leaves it alone and only
+            # revokes the others. Without this, a second, older reset
+            # link could still be used to take the account over again
+            # after the user already completed a reset.
+            self._tokens.revoke_all_password_reset_for_user(user.id, now)
+            self._sessions.revoke_all_for_user(user.id, "password_reset")
+            self._db.commit()
+        except Exception:
+            self._db.rollback()
+            raise
         self._audit(user.id, "auth.password_reset_completed", AuditOutcome.SUCCESS)
 
     def _audit(self, user_id: uuid.UUID, event_type: str, outcome: AuditOutcome) -> None:

@@ -58,6 +58,18 @@ class OneTimeTokenRepository:
         self._db.flush()
 
     def revoke_all_password_reset_for_user(self, user_id: uuid.UUID, at: datetime) -> None:
+        """Revokes every currently-outstanding (unconsumed, unrevoked)
+        password-reset token for this user - never touches invitation
+        tokens (filtered by `purpose`) or any other user's tokens
+        (filtered by `user_id`), and never touches an already-consumed
+        token (an already-consumed token is excluded by the
+        `consumed_at.is_(None)` filter, so calling this right after
+        `consume()` on a just-submitted token leaves that one alone - see
+        both call sites in `app.services.password_reset_service`: issuing
+        a new token revokes any older ones first, and completing a reset
+        revokes every other outstanding one after consuming the submitted
+        token, so a second, older reset link can never be replayed to
+        take the account over again)."""
         stmt = select(OneTimeToken).where(
             OneTimeToken.user_id == user_id,
             OneTimeToken.purpose == TokenPurpose.PASSWORD_RESET,

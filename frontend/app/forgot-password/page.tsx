@@ -1,7 +1,12 @@
 "use client";
 
 import { useState } from "react";
-import { apiFetch, errorMessage } from "../lib/api";
+import { apiFetch, errorMessage, isDevelopmentIdentityAvailable } from "../lib/api";
+import {
+  FORGOT_PASSWORD_DEVELOPMENT_NOTE,
+  FORGOT_PASSWORD_SUCCESS_BODY,
+  FORGOT_PASSWORD_SUCCESS_HEADING,
+} from "../lib/forgot-password-copy";
 
 export default function ForgotPasswordPage() {
   const [email, setEmail] = useState("");
@@ -33,10 +38,13 @@ export default function ForgotPasswordPage() {
   if (submitted) {
     return (
       <main style={{ fontFamily: "system-ui, sans-serif", padding: "2rem", maxWidth: 420 }}>
-        <h1>Check your email</h1>
-        <p>
-          If an account exists for that email address, a password reset link has been sent to it.
-        </p>
+        <h1>{FORGOT_PASSWORD_SUCCESS_HEADING}</h1>
+        <p>{FORGOT_PASSWORD_SUCCESS_BODY}</p>
+        {isDevelopmentIdentityAvailable() && (
+          <p style={{ marginTop: "1rem", fontSize: "0.85rem", opacity: 0.75 }}>
+            {FORGOT_PASSWORD_DEVELOPMENT_NOTE}
+          </p>
+        )}
       </main>
     );
   }
@@ -58,7 +66,7 @@ export default function ForgotPasswordPage() {
           style={{ padding: "0.25rem", width: "100%", marginBottom: "0.75rem" }}
         />
         <button type="submit" disabled={submitting}>
-          {submitting ? "Sending…" : "Send reset link"}
+          {submitting ? "Requesting…" : "Request password reset"}
         </button>
         {error && <p role="alert">{error}</p>}
       </form>

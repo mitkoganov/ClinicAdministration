@@ -136,6 +136,17 @@ begins.
   (`password_reset_token_lifetime_minutes`/`invitation_token_lifetime_hours`),
   and only their hash is stored — the raw token is never persisted,
   logged, or echoed back in any API response.
+* **Threat: an older/leaked password-reset link surviving a completed
+  reset.** A user requests more than one reset link (e.g. forgets they
+  already asked, or a leaked older link is later attempted). **Mitigation:**
+  `PasswordResetService` keeps at most one outstanding reset token per
+  account at any time — requesting a new one revokes every older
+  outstanding token first (`OneTimeTokenRepository.
+  revoke_all_password_reset_for_user`), and completing a reset revokes
+  every *other* outstanding token for that account in the same
+  transaction as the password update and token consumption. A stale or
+  leaked reset link can never be used to take the account over again
+  after a reset has already completed.
 * **Threat: password-change or logout leaving other stolen sessions
   active.** **Mitigation:** `AuthService.change_password` revokes every
   *other* session for that user in the same transaction as the password

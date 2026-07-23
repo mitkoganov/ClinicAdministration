@@ -257,7 +257,13 @@ production deployment/observability story — see "Known limitations" below.
   (`password_reset` / `invitation`) single-use token — `id`, `user_id`,
   `token_hash`, `purpose`, `expires_at`, `used_at`. The raw token is never
   persisted, logged, or returned in any API response body; it exists only
-  in the URL a user follows (see "Known limitations" on delivery).
+  in the URL a user follows (see "Known limitations" on delivery). At
+  most one `password_reset` token is ever outstanding per account:
+  `PasswordResetService.request_reset` revokes any older outstanding one
+  before issuing a new one, and `confirm_reset` revokes every *other*
+  outstanding one (in the same transaction as the password update and
+  the submitted token's own consumption) — an older or leaked reset link
+  can never survive a completed reset (see SECURITY.md).
 
 ### Session lifecycle and cookies
 
