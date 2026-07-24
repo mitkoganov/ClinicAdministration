@@ -8,11 +8,20 @@ logger = logging.getLogger(__name__)
 
 class AppError(Exception):
     """Base application error. Carries a safe, user-facing message only —
-    never include secrets or internal exception details here."""
+    never include secrets or internal exception details here.
 
-    def __init__(self, message: str, status_code: int = 500) -> None:
+    `code` is an optional, stable, machine-readable identifier (e.g.
+    "appointment_conflict") - MED-005 introduces it for calendar/
+    appointment domain errors that need a code a frontend can branch on
+    without parsing `message` text; every pre-MED-005 error leaves it
+    `None`, and the response body omits the `code` key entirely in that
+    case, so this is a backward-compatible, additive extension of the
+    existing `{"detail": ...}` envelope, not a breaking change to it."""
+
+    def __init__(self, message: str, status_code: int = 500, code: str | None = None) -> None:
         self.message = message
         self.status_code = status_code
+        self.code = code
         super().__init__(message)
 
 
@@ -97,10 +106,24 @@ class WeakPasswordError(AppError):
         super().__init__(message, status_code=422)
 
 
+class CalendarConflictError(ConflictError):
+    """MED-005: a machine-readable 409 for calendar/appointment domain
+    conflicts - `code` lets the frontend distinguish "the DB rejected an
+    overlapping booking" from "someone else changed this appointment
+    first" without parsing the human-readable `message`."""
+
+    def __init__(self, message: str, code: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
 def register_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(AppError)
     async def handle_app_error(_: Request, exc: AppError) -> JSONResponse:
-        return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
+        content: dict[str, str] = {"detail": exc.message}
+        if exc.code is not None:
+            content["code"] = exc.code
+        return JSONResponse(status_code=exc.status_code, content=content)
 
     @app.exception_handler(Exception)
     async def handle_unexpected_error(_: Request, exc: Exception) -> JSONResponse:

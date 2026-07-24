@@ -7,6 +7,7 @@ the API layer purely as an early-rejection convenience on top of the same
 check — it is not itself the authorization boundary.
 """
 
+import uuid
 from collections.abc import Callable
 
 from fastapi import Depends
@@ -41,6 +42,51 @@ STAFF_READ_ROLES: frozenset[MembershipRole] = frozenset(
 STAFF_MANAGE_ROLES: frozenset[MembershipRole] = frozenset(
     {MembershipRole.OWNER, MembershipRole.MANAGER}
 )
+
+# --- MED-005: appointments and calendar foundation -------------------------
+# "Provider" is not a MembershipRole - it is a fact (a ProviderSchedule/
+# Appointment row referencing that user_id), not a permission grant. Every
+# active tenant member, regardless of role, may always view/act on a
+# calendar filtered to THEMSELVES as the provider (a bare identity check
+# performed at the service layer, not expressed as a role set here).
+CALENDAR_READ_ROLES: frozenset[MembershipRole] = frozenset(
+    {MembershipRole.OWNER, MembershipRole.MANAGER, MembershipRole.OPERATOR, MembershipRole.AUDITOR}
+)
+CALENDAR_WRITE_ROLES: frozenset[MembershipRole] = frozenset(
+    {MembershipRole.OWNER, MembershipRole.MANAGER, MembershipRole.OPERATOR}
+)
+CALENDAR_CONFIG_ROLES: frozenset[MembershipRole] = frozenset(
+    {MembershipRole.OWNER, MembershipRole.MANAGER}
+)
+CALENDAR_OVERRIDE_ROLES: frozenset[MembershipRole] = frozenset(
+    {MembershipRole.OWNER, MembershipRole.MANAGER}
+)
+# Roles permitted to see the full patient contact snapshot (phone/email).
+# AUDITOR may read the calendar but never the contact snapshot itself -
+# see tasks/current/task.md "Patient contact visibility". CONTENT_EDITOR
+# has no calendar permission at all in this task.
+CALENDAR_CONTACT_VISIBLE_ROLES: frozenset[MembershipRole] = frozenset(
+    {MembershipRole.OWNER, MembershipRole.MANAGER, MembershipRole.OPERATOR}
+)
+
+
+def require_calendar_read_or_self(
+    context: TenantContext | None, requested_provider_user_id: uuid.UUID
+) -> None:
+    """Task.md authorization matrix: "View own calendar (self as
+    provider) | any active member (self-scoped only)". Every active
+    tenant member may always view a calendar (including availability)
+    filtered to themselves as the provider, regardless of role - a bare
+    identity check (`provider_user_id == current user_id`), never a
+    broader grant. Viewing another provider's calendar/availability still
+    requires `CALENDAR_READ_ROLES`. Fails closed exactly like
+    `require_role`: a missing context is rejected the same way a
+    disallowed combination is."""
+    if context is None:
+        raise ForbiddenError("Not permitted to perform this action.")
+    if context.user_id == requested_provider_user_id:
+        return
+    require_role(context, CALENDAR_READ_ROLES)
 
 
 def require_role(context: TenantContext | None, allowed: frozenset[MembershipRole]) -> None:

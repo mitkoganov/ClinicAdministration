@@ -165,6 +165,48 @@ present.
      `http://localhost:3000/reset-password?token=<raw token>` — never
      print/log it, and never commit anything that does.
 
+## Appointments and calendar (local testing)
+
+The backend now has a rooms/service-types/provider-schedules/calendar-blocks
+configuration layer, a dynamic availability engine, and the full appointment
+lifecycle (`/api/v1/rooms`, `/api/v1/appointment-service-types`,
+`/api/v1/provider-schedules`, `/api/v1/calendar-blocks`,
+`/api/v1/availability`, `/api/v1/appointments`) — see
+[ARCHITECTURE.md](ARCHITECTURE.md) → "Appointments and calendar" and
+[SECURITY.md](SECURITY.md) → "Appointments and calendar threat model".
+
+1. Run migrations (adds `tenants.timezone` plus the six new calendar tables,
+   and requires the PostgreSQL `btree_gist` extension for the
+   provider/room double-booking exclusion constraints — the migration
+   itself runs `CREATE EXTENSION IF NOT EXISTS btree_gist`, so no manual
+   setup is needed as long as the database role can create extensions,
+   which the default `docker-compose.yml` Postgres role can):
+   ```powershell
+   cd backend
+   .venv\Scripts\python -m alembic upgrade head
+   ```
+2. A `Tenant` has its own IANA `timezone` (default `Europe/Sofia`) — every
+   schedule/availability/appointment-time calculation for that tenant
+   resolves through it. Set it directly on the row if you need a
+   different timezone for local testing; there is no settings-UI field
+   for it yet.
+3. Start the backend and frontend, sign in (or use the development
+   identity headers as above), then open `/calendar` for the day/week
+   booking UI (a view-mode toggle switches between them), or
+   `/settings/rooms`, `/settings/service-types`, `/settings/schedules`,
+   `/settings/blocks` for the configuration screens.
+4. A booking needs, in order: an active room (optional) and service type
+   (`/settings/rooms`, `/settings/service-types`), a `ProviderSchedule` for
+   the staff member acting as the provider (`/settings/schedules` — any
+   active `TenantMembership` user id works, there is no separate
+   "provider" role/record), then `/calendar` → "New appointment" → "Find
+   available slots".
+5. This foundation stage sends no appointment confirmation/reminder
+   emails, has no dedicated practitioner-profile module, and stores no
+   patient record beyond the per-appointment contact snapshot — see
+   ARCHITECTURE.md's "Known limitations" for the full list. Do not claim
+   otherwise in operator-facing material.
+
 ## Running tests
 
 Tests are split into two pytest markers: unit tests (no database

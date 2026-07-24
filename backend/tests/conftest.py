@@ -1,6 +1,6 @@
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import Session
 
 import app.models  # noqa: F401 - registers every model against Base.metadata before create_all/drop_all
@@ -9,7 +9,7 @@ from app.db.session import get_db
 from app.main import create_app
 from tests.db_safety import get_test_database_url
 
-pytest_plugins = ["tests.factories", "tests.auth_factories"]
+pytest_plugins = ["tests.factories", "tests.auth_factories", "tests.calendar_factories"]
 
 
 @pytest.fixture(scope="session")
@@ -27,6 +27,16 @@ def db_engine():
     DATABASE_URL."""
     test_database_url = get_test_database_url()
     engine = create_engine(test_database_url, future=True)
+    # `create_all()` builds the schema directly from ORM metadata, bypassing
+    # Alembic migrations entirely - it never runs the migration's own
+    # `CREATE EXTENSION IF NOT EXISTS btree_gist` (see
+    # alembic/versions/00e7f6cca017_*.py), which the appointments table's
+    # GiST exclusion constraints require. Without this, a genuinely fresh
+    # test database (e.g. a freshly (re)started tmpfs-backed postgres-test
+    # container) fails with "data type uuid has no default operator class
+    # for access method gist" the first time any test touches Appointment.
+    with engine.begin() as connection:
+        connection.execute(text("CREATE EXTENSION IF NOT EXISTS btree_gist"))
     Base.metadata.drop_all(engine)
     Base.metadata.create_all(engine)
     yield engine

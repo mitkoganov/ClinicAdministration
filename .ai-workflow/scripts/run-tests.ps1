@@ -100,7 +100,45 @@ $gitDiffCheck = Test-GitDiffCheck -Root $root -ExcludePathspecs @(":(exclude)rep
 Add-Result "git-diff-check" $gitDiffCheck.ExitCode $gitDiffCheck.Output
 
 $fence = [string]::new('`', 3)
-$lines = @("# Quality gate run", "")
+$failed = $results | Where-Object { $_.ExitCode -ne 0 }
+
+# --- Machine-readable summary: a small, stable, regex-extractable block
+# consumed by .ai-workflow/scripts/run-review.ps1's compact-evidence
+# extraction (Get-CompactQualityEvidence) so the review packet never has
+# to embed this report's full verbose output (Docker build logs, package
+# downloads, etc.) to prove what passed. Derived directly from the same
+# $results this report's detailed section below is built from - never a
+# separately-maintained/hand-typed number that could drift from the real
+# gate outcomes.
+function Get-PytestPassedCount($output) {
+    $m = [regex]::Match($output, '(\d+) passed')
+    if ($m.Success) { return [int]$m.Groups[1].Value }
+    return $null
+}
+$unitResult = $results | Where-Object { $_.Name -eq "backend-unit-pytest" } | Select-Object -First 1
+$integrationResult = $results | Where-Object { $_.Name -eq "backend-integration-pytest" } | Select-Object -First 1
+$unitCount = if ($unitResult) { Get-PytestPassedCount $unitResult.Output } else { $null }
+$integrationCount = if ($integrationResult) { Get-PytestPassedCount $integrationResult.Output } else { $null }
+$totalCount = if ($null -ne $unitCount -and $null -ne $integrationCount) { $unitCount + $integrationCount } else { $null }
+$overallResult = if ($failed) { "FAIL" } else { "PASS" }
+
+$summaryLines = @(
+    "## Machine-readable summary", "",
+    $fence,
+    "overall_result: $overallResult",
+    "gate_count: $($results.Count)",
+    "failed_gate_count: $($failed.Count)",
+    "backend_unit_test_count: $(if ($null -ne $unitCount) { $unitCount } else { 'unknown' })",
+    "backend_integration_test_count: $(if ($null -ne $integrationCount) { $integrationCount } else { 'unknown' })",
+    "backend_total_test_count: $(if ($null -ne $totalCount) { $totalCount } else { 'unknown' })"
+)
+foreach ($r in $results) {
+    $summaryLines += "gate.$($r.Name): $(if ($r.ExitCode -eq 0) { 'PASS' } else { 'FAIL' })"
+}
+$summaryLines += $fence
+$summaryLines += ""
+
+$lines = @("# Quality gate run", "") + $summaryLines
 foreach ($r in $results) {
     $status = if ($r.ExitCode -eq 0) { "PASS" } else { "FAIL" }
     $lines += "## $($r.Name) - $status (exit $($r.ExitCode))"
@@ -113,7 +151,6 @@ foreach ($r in $results) {
 $report = $lines -join "`n"
 Write-WorkflowReport -Name "quality-gates-latest.md" -Content $report
 
-$failed = $results | Where-Object { $_.ExitCode -ne 0 }
 if ($failed) {
     Write-Error "$($failed.Count) check(s) failed: $($failed.Name -join ', ')"
     exit 1

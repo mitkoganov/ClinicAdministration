@@ -18,6 +18,7 @@ class ClinicRead(BaseModel):
     slug: str
     status: TenantStatus
     role: MembershipRole
+    timezone: str
 
 
 class ClinicUpdate(BaseModel):

@@ -26,7 +26,12 @@ def get_clinic(
 ) -> ClinicRead:
     tenant = ClinicService(db).get(context)
     return ClinicRead(
-        id=tenant.id, name=tenant.name, slug=tenant.slug, status=tenant.status, role=context.role
+        id=tenant.id,
+        name=tenant.name,
+        slug=tenant.slug,
+        status=tenant.status,
+        role=context.role,
+        timezone=tenant.timezone,
     )
 
 
@@ -38,5 +43,10 @@ def update_clinic(
 ) -> ClinicRead:
     tenant = ClinicService(db).update(context, payload.name)
     return ClinicRead(
-        id=tenant.id, name=tenant.name, slug=tenant.slug, status=tenant.status, role=context.role
+        id=tenant.id,
+        name=tenant.name,
+        slug=tenant.slug,
+        status=tenant.status,
+        role=context.role,
+        timezone=tenant.timezone,
     )

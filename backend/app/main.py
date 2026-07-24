@@ -1,8 +1,14 @@
 from fastapi import FastAPI
 
+from app.api.appointments import router as appointments_router
 from app.api.auth import router as auth_router
+from app.api.availability import router as availability_router
+from app.api.calendar_blocks import router as calendar_blocks_router
 from app.api.clinic import router as clinic_router
 from app.api.health import router as health_router
+from app.api.provider_schedules import router as provider_schedules_router
+from app.api.rooms import router as rooms_router
+from app.api.service_types import router as service_types_router
 from app.api.staff import router as staff_router
 from app.api.tenant_context import router as tenant_context_router
 from app.api.tenant_scoped_records import router as tenant_scoped_records_router
@@ -30,6 +36,12 @@ def create_app() -> FastAPI:
     app.include_router(tenant_scoped_records_router)
     app.include_router(clinic_router)
     app.include_router(staff_router)
+    app.include_router(rooms_router)
+    app.include_router(service_types_router)
+    app.include_router(provider_schedules_router)
+    app.include_router(calendar_blocks_router)
+    app.include_router(availability_router)
+    app.include_router(appointments_router)
 
     return app
 
