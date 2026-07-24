@@ -82,17 +82,136 @@
 # default) drops the compact Tier 2 baseline-evidence/frontend-unchanged-
 # evidence sections, keeping Tier 0/1 only, for a smaller diagnostic
 # packet.
+#
+# -IncludeVerboseEvidence (default off): the two allowlisted evidence
+# reports (reports/quality-gates-latest.md, reports/migration-validation-
+# latest.md) are embedded as a COMPACT, deterministically-extracted
+# summary by default (see Get-CompactEvidence below) - full verbatim
+# embedding (the old, default-on behavior) is what grew an Incremental
+# packet past budget on a long-running branch: these reports accumulate
+# verbose Docker build logs, package-download output, and repeated
+# command transcripts round after round, none of which a reviewer needs
+# to verify "did the gates pass" - only the PASS/FAIL per gate and the
+# test counts do. Pass this switch to fall back to full verbatim
+# embedding for debugging the extraction itself. Compact evidence is
+# still Tier 1 (never dropped) and still goes through the same
+# $EvidenceAllowlist/Add-EvidenceSection path as before - only the
+# CONTENT embedded for those two paths changed, not their tier or
+# allowlist status.
+#
+# -ValidateCompactEvidence: builds several compact-evidence extractions
+# against disposable temporary report files (never this repo's own
+# reports/) covering a passing report, a report with a failed gate, a
+# report missing its machine-readable summary block, and a migration
+# report with a failed step - asserts Get-CompactEvidence extracts the
+# right fields, hard-fails (throws) on a missing marker or a non-PASS
+# result, never embeds the raw verbose body, and produces a summary far
+# smaller than the raw input. Exits non-zero without invoking Codex if
+# any assertion fails.
 
 param(
     [switch]$DryRun, [switch]$ValidateProvenance, [switch]$ValidateDiffCollection,
     [switch]$Incremental, [string]$BaselineCommit, [string]$ToCommit,
-    [switch]$ExcludeContextManifest
+    [switch]$ExcludeContextManifest, [switch]$IncludeVerboseEvidence,
+    [switch]$ValidateCompactEvidence
 )
 
 . "$PSScriptRoot\common.ps1"
 
 $root = Get-RepoRoot
 $fence = [string]::new('`', 3)
+
+# ===========================================================================
+# Compact evidence extraction (see -IncludeVerboseEvidence above for why).
+# Deterministic: every field comes from parsing the raw report's own
+# "## Machine-readable summary" fenced key:value block (written by
+# run-tests.ps1 for reports/quality-gates-latest.md, and hand-maintained
+# for reports/migration-validation-latest.md, which has no separate
+# generator script) plus a SHA-256 hash of the complete raw file - never a
+# freely-invented summary. Throws (hard fail, never a partially-built
+# packet) if the marker block is missing, if a required key is absent, or
+# if the extracted overall/step result is not PASS - a compact summary
+# must never be able to claim PASS when the raw report does not actually
+# show it.
+# ===========================================================================
+function Get-Sha256Hex {
+    param([string]$Content)
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($Content)
+        $hash = $sha256.ComputeHash($bytes)
+        return -join ($hash | ForEach-Object { $_.ToString("x2") })
+    } finally {
+        $sha256.Dispose()
+    }
+}
+
+function Get-MachineReadableSummaryBlock {
+    # Extracts the key:value lines inside the FIRST fenced block that
+    # immediately follows a "## Machine-readable summary" heading. Returns
+    # $null (never a partial/best-guess hashtable) if the heading or its
+    # fence is not found, so callers can hard-fail deterministically.
+    param([string]$RawContent)
+    $match = [regex]::Match(
+        $RawContent,
+        '##\s*Machine-readable summary\s*\r?\n\r?\n```[^\r\n]*\r?\n(?<body>.*?)\r?\n```',
+        [System.Text.RegularExpressions.RegexOptions]::Singleline
+    )
+    if (-not $match.Success) { return $null }
+    $fields = @{}
+    foreach ($line in ($match.Groups["body"].Value -split "`r?`n")) {
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        $parts = $line -split ":", 2
+        if ($parts.Count -eq 2) { $fields[$parts[0].Trim()] = $parts[1].Trim() }
+    }
+    return $fields
+}
+
+function Get-CompactEvidence {
+    # $RequiredKeys: keys that MUST be present (hard fail otherwise).
+    # $PassKeys: keys whose value must literally be "PASS" (hard fail on
+    # any other value, including "FAIL" or "unknown") for this evidence to
+    # be usable at all - the whole point is a compact summary can never
+    # assert something the raw report doesn't actually show.
+    param(
+        [Parameter(Mandatory)][string]$RawContent,
+        [Parameter(Mandatory)][string]$RelPath,
+        [string[]]$RequiredKeys,
+        [string[]]$PassKeys
+    )
+    $hash = Get-Sha256Hex -Content $RawContent
+    $rawChars = $RawContent.Length
+    $fields = Get-MachineReadableSummaryBlock -RawContent $RawContent
+    if ($null -eq $fields) {
+        throw "Compact evidence extraction FAILED for '$RelPath': no '## Machine-readable summary' fenced block found. Regenerate this report (it must include that section) before running the review."
+    }
+    foreach ($key in $RequiredKeys) {
+        if (-not $fields.ContainsKey($key)) {
+            throw "Compact evidence extraction FAILED for '$RelPath': required key '$key' is missing from its machine-readable summary block."
+        }
+    }
+    foreach ($key in $PassKeys) {
+        if ($fields[$key] -ne "PASS") {
+            throw "Compact evidence extraction FAILED for '$RelPath': '$key' is '$($fields[$key])', not PASS. A failed/incomplete evidence report can never be presented to Codex as passing - fix the underlying failure and regenerate the report first."
+        }
+    }
+    $summaryLines = [System.Collections.Generic.List[string]]::new()
+    $summaryLines.Add("Evidence mode: compact (deterministically extracted from the raw report's own machine-readable summary block - see -IncludeVerboseEvidence to embed the full raw report instead).")
+    $summaryLines.Add("Raw report path: $RelPath")
+    $summaryLines.Add("Raw report SHA-256: $hash")
+    $summaryLines.Add("Raw report size: $rawChars characters")
+    foreach ($key in ($fields.Keys | Sort-Object)) {
+        $summaryLines.Add("${key}: $($fields[$key])")
+    }
+    $compactContent = $summaryLines -join "`n"
+    return @{
+        Hash = $hash
+        RawChars = $rawChars
+        CompactChars = $compactContent.Length
+        Fields = $fields
+        CompactContent = $compactContent
+    }
+}
 
 # Fixed, explicit allowlist - never a pattern/wildcard - of the only
 # reports/ files ever permitted to be embedded as evidence despite the
@@ -279,7 +398,8 @@ function Build-ReviewPacket {
         [switch]$Incremental,
         [string]$BaselineCommit,
         [string]$ToCommit,
-        [switch]$ExcludeContextManifest
+        [switch]$ExcludeContextManifest,
+        [switch]$IncludeVerboseEvidence
     )
 
     $sections = [System.Collections.Generic.List[hashtable]]::new()
@@ -414,7 +534,8 @@ function Build-ReviewPacket {
             "  - Tier 2: fixed auth context files not already covered by the diff, compact Git-derived baseline evidence, frontend-unchanged evidence - dropped only if the packet cannot otherwise fit under budget",
             "  - Tier 3: anything else - dropped first under budget pressure",
             "- Do not request the full contents of files outside this packet on the theory that 'unchanged' cannot be trusted without them: the baseline evidence section below is Git-derived (commit hashes, blob hashes) precisely so unchanged state is verifiable without re-embedding it.",
-            "- Only report REVIEW_INCOMPLETE if a specific file this incremental diff actually touched, or a specific fixed auth-context file, is missing from this packet - not for optional/unrelated repository content."
+            "- The quality-gate and migration evidence sections below are COMPACT summaries, not the full raw report text: each is deterministically extracted from that report's own 'Machine-readable summary' block, plus a SHA-256 hash and character count of the complete raw file on disk. Extraction hard-fails before this review would even run if a required marker is missing or if any extracted result is not PASS - so a compact summary present in this packet is exactly as trustworthy as the full raw log would be. This is an intentional evidence-compaction choice (see run-review.ps1's -IncludeVerboseEvidence), never treat the absence of the raw Docker/Alembic log text as an omission worth a REVIEW_INCOMPLETE.",
+            "- Only report REVIEW_INCOMPLETE if a specific file this incremental diff actually touched, or a specific fixed auth-context file, is missing from this packet - not for optional/unrelated repository content, and not for the raw (non-compact) form of the quality/migration evidence."
         ) -join "`n"
         Add-Section -Title "Review mode: incremental" -RelPath "(review mode header)" -Content $headerLines -Tier 1
     }
@@ -469,11 +590,36 @@ function Build-ReviewPacket {
         "incremental"          { "the review baseline commit $baselineResolved (staged + unstaged combined)" }
         default                 { "the merge-base commit" }
     }
-    $fullDiffLines = & git -C $RepoRoot diff --no-ext-diff -M --unified=80 @diffRangeArg
+    # Wholly-added tracked files (git status "A") are excluded from THIS
+    # diff via pathspec and diffed separately below with --unified=0 (a
+    # bare "every line is new" hunk, no surrounding context) - the
+    # per-file "Tracked changed file (full current content)" section
+    # created later in this function already embeds that same file's
+    # complete final content in full, so a --unified=80 rendering of a
+    # pure addition here would be near-total duplication (every line
+    # appears twice in the packet for zero additional review value,
+    # since there is no "before" state to contrast against). Modified/
+    # renamed/deleted files keep their full --unified=80 context here,
+    # where the delta itself (not just the final state) is the evidence
+    # that matters. This does not weaken Tier 1/completeness: added files
+    # remain Tier 1 via their own per-file section either way (see the
+    # changed-file completeness validation below, which checks for a
+    # per-PATH section, not this combined diff section).
+    $addedFilePaths = [System.Collections.Generic.List[string]]::new()
+    foreach ($line in @(& git -C $RepoRoot diff --name-status -M @diffRangeArg)) {
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        $fields = $line -split "`t"
+        if ($fields[0] -eq "A") { $addedFilePaths.Add($fields[1]) }
+    }
+    $diffPathspecExclusions = $addedFilePaths | ForEach-Object { ":(exclude)$_" }
+    $fullDiffLines = & git -C $RepoRoot diff --no-ext-diff -M --unified=80 @diffRangeArg -- . @diffPathspecExclusions
     $fullDiff = ($fullDiffLines | Out-String).Trim()
-    if ([string]::IsNullOrWhiteSpace($fullDiff)) { $fullDiff = "(empty - no tracked-file changes; all changes are untracked new files, see below)" }
-    Add-Section -Title "git diff --no-ext-diff -M --unified=80 $diffRangeArg (tracked-file changes, relative to $baselineDescription)" -RelPath "(git diff)" `
-        -Content "$fence`ndiff`n$fullDiff`n$fence" -Tier 1
+    if ([string]::IsNullOrWhiteSpace($fullDiff)) { $fullDiff = "(empty relative to $baselineDescription, after excluding wholly-added files below - either no tracked-file changes at all, or every tracked change in range is itself a wholly-added file.)" }
+    $addedFilesNote = if ($addedFilePaths.Count -gt 0) {
+        "`n`nWholly-added files ($($addedFilePaths.Count)) are intentionally NOT re-diffed here (this would just repeat every line as a `"+`" addition with zero prior state to contrast against) - each has its own full-content `"Tracked changed file`"/`"Untracked file`" section below instead, which is the complete review evidence for a pure addition:`n" + ($addedFilePaths -join "`n")
+    } else { "" }
+    Add-Section -Title "git diff --no-ext-diff -M --unified=80 $diffRangeArg (tracked MODIFIED/renamed/deleted file changes, relative to $baselineDescription - wholly-added files are excluded here, see note)" -RelPath "(git diff)" `
+        -Content "$fence`ndiff`n$fullDiff`n$fence$addedFilesNote" -Tier 1
 
     # In Incremental mode, every file the diff touches is Tier 1 (never
     # droppable) - the whole point of this mode is that nothing the
@@ -663,10 +809,18 @@ function Build-ReviewPacket {
     $qualityGatePath = Join-Path $RepoRoot "reports\quality-gates-latest.md"
     if (Test-Path $qualityGatePath) {
         $qgContent = Get-Content -Raw -Encoding utf8 -Path $qualityGatePath
+        if ($IncludeVerboseEvidence) {
+            $qgSectionContent = "$fence`n$qgContent`n$fence"
+        } else {
+            $qgEvidence = Get-CompactEvidence -RawContent $qgContent -RelPath "reports/quality-gates-latest.md" `
+                -RequiredKeys @("overall_result", "backend_unit_test_count", "backend_integration_test_count", "backend_total_test_count") `
+                -PassKeys @("overall_result")
+            $qgSectionContent = "$fence`n$($qgEvidence.CompactContent)`n$fence"
+        }
         Add-EvidenceSection -RelPath "reports/quality-gates-latest.md" `
             -Title "Latest quality-gate report (reports/quality-gates-latest.md)" `
-            -Content "$fence`n$qgContent`n$fence" -Tier 1 `
-            -Description "Latest official quality-gate run output (ruff/mypy/pytest/frontend/Docker checks)."
+            -Content $qgSectionContent -Tier 1 `
+            -Description "Latest official quality-gate run output (ruff/mypy/pytest/frontend/Docker checks) - $(if ($IncludeVerboseEvidence) { 'full raw report' } else { 'compact, hash-verified summary (see -IncludeVerboseEvidence for the full raw report)' })."
         Add-Section -Title "Test output" -RelPath "(test output)" `
             -Content "Included within the quality-gate report above (see the backend-pytest section)." -Tier 1
     } else {
@@ -680,10 +834,18 @@ function Build-ReviewPacket {
     $migrationReportPath = Join-Path $RepoRoot "reports\migration-validation-latest.md"
     if (Test-Path $migrationReportPath) {
         $migrationContent = Get-Content -Raw -Encoding utf8 -Path $migrationReportPath
+        if ($IncludeVerboseEvidence) {
+            $migSectionContent = "$fence`n$migrationContent`n$fence"
+        } else {
+            $migEvidence = Get-CompactEvidence -RawContent $migrationContent -RelPath "reports/migration-validation-latest.md" `
+                -RequiredKeys @("target_revision", "upgrade_result", "downgrade_result", "reupgrade_result", "provider_exclusion_constraint", "room_exclusion_constraint") `
+                -PassKeys @("upgrade_result", "downgrade_result", "reupgrade_result", "provider_exclusion_constraint", "room_exclusion_constraint")
+            $migSectionContent = "$fence`n$($migEvidence.CompactContent)`n$fence"
+        }
         Add-EvidenceSection -RelPath "reports/migration-validation-latest.md" `
             -Title "Migration upgrade/downgrade output (reports/migration-validation-latest.md)" `
-            -Content "$fence`n$migrationContent`n$fence" -Tier 1 `
-            -Description "Alembic upgrade/downgrade/re-upgrade validation transcript."
+            -Content $migSectionContent -Tier 1 `
+            -Description "Alembic upgrade/downgrade/re-upgrade validation transcript - $(if ($IncludeVerboseEvidence) { 'full raw report' } else { 'compact, hash-verified summary (see -IncludeVerboseEvidence for the full raw report)' })."
     } else {
         Add-Section -Title "Migration upgrade/downgrade output" -RelPath "(migration validation output)" `
             -Content "NOT AVAILABLE - reports/migration-validation-latest.md does not exist." -Tier 1
@@ -1094,6 +1256,130 @@ if ($ValidateDiffCollection) {
     exit 0
 }
 
+# ===========================================================================
+# -ValidateCompactEvidence: exercises Get-CompactEvidence against disposable
+# temporary report files under the OS temp directory - never this repo's own
+# reports/. Never invokes Codex.
+# ===========================================================================
+if ($ValidateCompactEvidence) {
+    $failures = [System.Collections.Generic.List[string]]::new()
+    $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("review-compact-evidence-" + [System.Guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $tempDir | Out-Null
+
+    try {
+        $passingReport = @(
+            "# Quality gate run", "",
+            "## Machine-readable summary", "",
+            '```',
+            "overall_result: PASS",
+            "gate_count: 3",
+            "failed_gate_count: 0",
+            "backend_unit_test_count: 184",
+            "backend_integration_test_count: 367",
+            "backend_total_test_count: 551",
+            "gate.backend-ruff: PASS",
+            '```', "",
+            "## backend-ruff - PASS (exit 0)", "",
+            '```', ("x" * 5000), '```'
+        ) -join "`n"
+
+        # 1: a PASS report extracts every required field correctly.
+        $evidence = Get-CompactEvidence -RawContent $passingReport -RelPath "test/passing.md" `
+            -RequiredKeys @("overall_result", "backend_unit_test_count", "backend_integration_test_count", "backend_total_test_count") `
+            -PassKeys @("overall_result")
+        if ($evidence.Fields["overall_result"] -ne "PASS") { $failures.Add("Scenario 1: overall_result was not extracted as PASS.") }
+        if ($evidence.Fields["backend_unit_test_count"] -ne "184") { $failures.Add("Scenario 1: backend_unit_test_count was not extracted as 184.") }
+        if ($evidence.Fields["backend_integration_test_count"] -ne "367") { $failures.Add("Scenario 1: backend_integration_test_count was not extracted as 367.") }
+        if ($evidence.Fields["backend_total_test_count"] -ne "551") { $failures.Add("Scenario 1: backend_total_test_count was not extracted as 551.") }
+
+        # 2: the SHA-256 hash is included and matches a fresh computation.
+        $expectedHash = Get-Sha256Hex -Content $passingReport
+        if ($evidence.Hash -ne $expectedHash) { $failures.Add("Scenario 2: extracted hash does not match a fresh SHA-256 computation of the same content.") }
+
+        # 3: the compact summary is far smaller than the raw report, and
+        # never contains the raw report's verbose body text.
+        if ($evidence.CompactChars -ge $evidence.RawChars) { $failures.Add("Scenario 3: compact summary is not smaller than the raw report.") }
+        if ($evidence.CompactContent -match "x{100,}") { $failures.Add("Scenario 3 (raw log leakage): compact summary embeds the raw report's verbose body text.") }
+
+        # 4: a failed gate (overall_result: FAIL) hard-fails extraction -
+        # a compact summary must never be able to claim usable evidence
+        # from a report that itself shows a failure.
+        $failingReport = $passingReport -replace "overall_result: PASS", "overall_result: FAIL"
+        $threwOnFail = $false
+        try {
+            Get-CompactEvidence -RawContent $failingReport -RelPath "test/failing.md" `
+                -RequiredKeys @("overall_result") -PassKeys @("overall_result") | Out-Null
+        } catch { $threwOnFail = $true }
+        if (-not $threwOnFail) { $failures.Add("Scenario 4: Get-CompactEvidence did not hard-fail on overall_result: FAIL.") }
+
+        # 5: a report missing the machine-readable summary block entirely
+        # hard-fails extraction - never silently returns an empty/partial
+        # summary that could be mistaken for a real (passing) one.
+        $noMarkerReport = "# Quality gate run`n`nSome prose with no machine-readable summary block at all.`n"
+        $threwOnMissing = $false
+        try {
+            Get-CompactEvidence -RawContent $noMarkerReport -RelPath "test/no-marker.md" `
+                -RequiredKeys @("overall_result") -PassKeys @("overall_result") | Out-Null
+        } catch { $threwOnMissing = $true }
+        if (-not $threwOnMissing) { $failures.Add("Scenario 5: Get-CompactEvidence did not hard-fail on a report with no machine-readable summary block.") }
+
+        # 6: a report whose summary block is missing a REQUIRED key
+        # hard-fails, even if every present key says PASS.
+        $missingKeyReport = @(
+            "## Machine-readable summary", "",
+            '```',
+            "overall_result: PASS",
+            '```'
+        ) -join "`n"
+        $threwOnMissingKey = $false
+        try {
+            Get-CompactEvidence -RawContent $missingKeyReport -RelPath "test/missing-key.md" `
+                -RequiredKeys @("overall_result", "backend_unit_test_count") -PassKeys @("overall_result") | Out-Null
+        } catch { $threwOnMissingKey = $true }
+        if (-not $threwOnMissingKey) { $failures.Add("Scenario 6: Get-CompactEvidence did not hard-fail on a summary block missing a required key.") }
+
+        # 7: migration-shaped report - target revision and every PASS-gated
+        # constraint result extract correctly.
+        $migrationReport = @(
+            "# Migration validation", "",
+            "## Machine-readable summary", "",
+            '```',
+            "target_revision: 00e7f6cca017",
+            "upgrade_result: PASS",
+            "downgrade_result: PASS",
+            "reupgrade_result: PASS",
+            "provider_exclusion_constraint: PASS",
+            "room_exclusion_constraint: PASS",
+            '```'
+        ) -join "`n"
+        $migEvidence = Get-CompactEvidence -RawContent $migrationReport -RelPath "test/migration.md" `
+            -RequiredKeys @("target_revision", "upgrade_result", "downgrade_result", "reupgrade_result", "provider_exclusion_constraint", "room_exclusion_constraint") `
+            -PassKeys @("upgrade_result", "downgrade_result", "reupgrade_result", "provider_exclusion_constraint", "room_exclusion_constraint")
+        if ($migEvidence.Fields["target_revision"] -ne "00e7f6cca017") { $failures.Add("Scenario 7: target_revision was not extracted correctly.") }
+
+        # 8: a migration report with one failed step (downgrade_result:
+        # FAIL) hard-fails, even though every other field says PASS.
+        $migrationFailReport = $migrationReport -replace "downgrade_result: PASS", "downgrade_result: FAIL"
+        $threwOnMigFail = $false
+        try {
+            Get-CompactEvidence -RawContent $migrationFailReport -RelPath "test/migration-fail.md" `
+                -RequiredKeys @("downgrade_result") -PassKeys @("upgrade_result", "downgrade_result", "reupgrade_result") | Out-Null
+        } catch { $threwOnMigFail = $true }
+        if (-not $threwOnMigFail) { $failures.Add("Scenario 8: Get-CompactEvidence did not hard-fail on a migration report with a failed step.") }
+    } finally {
+        Remove-Item -Recurse -Force $tempDir -ErrorAction SilentlyContinue
+    }
+
+    if ($failures.Count -gt 0) {
+        Write-Host "Compact-evidence validation FAILED:"
+        foreach ($f in $failures) { Write-Host "  - $f" }
+        exit 1
+    }
+
+    Write-Host "Compact-evidence validation PASSED (8 scenarios)."
+    exit 0
+}
+
 if (-not (Test-CommandAvailable "codex")) {
     Write-Error "codex CLI not found on PATH. Install with: npm install -g @openai/codex"
     exit 1
@@ -1104,7 +1390,7 @@ Set-Location $root
 $config = Get-WorkflowConfig
 $packet = Build-ReviewPacket -RepoRoot $root -ProtectedBranches $config.protectedBranches `
     -Incremental:$Incremental -BaselineCommit $BaselineCommit -ToCommit $ToCommit `
-    -ExcludeContextManifest:$ExcludeContextManifest
+    -ExcludeContextManifest:$ExcludeContextManifest -IncludeVerboseEvidence:$IncludeVerboseEvidence
 
 if ($packet.Mode -eq "nothing-to-review") {
     Write-Host $packet.NothingToReviewReason
