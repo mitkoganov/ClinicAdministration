@@ -430,13 +430,254 @@ All under `/api/v1/auth` (`backend/app/api/auth.py`):
   for the auth subsystem specifically are out of scope for this
   foundation slice.
 
+## Appointments and calendar
+
+**[implemented — MED-005]** The first scheduling/booking vertical slice,
+layered on the tenant/membership and clinic/staff foundations above. There
+is still no dedicated `Practitioner` model — "provider" is a fact (a
+`TenantMembership.user_id` referenced by a schedule/appointment row), not a
+role or a separate identity; that distinct practitioner-records module
+remains **[planned]**, and this slice does not add billing, patient-record
+storage, or any notification delivery (see "Known limitations" below).
+
+### Domain model
+
+* `Tenant.timezone` (`backend/app/models/tenant.py`) — an IANA name
+  (`Europe/Sofia` default), validated via `zoneinfo.ZoneInfo` at the model
+  layer (`app.core.timezone.validate_timezone_name`). Every wall-clock
+  calculation for that tenant (schedules, availability, calendar-day
+  boundaries) resolves through this column — there is no per-request or
+  per-request-header timezone override.
+* `ClinicRoom`, `AppointmentServiceType` (`backend/app/models/clinic_room.py`,
+  `appointment_service_type.py`) — tenant-scoped configuration rows with a
+  two-value `status` (`active`/`inactive`, never a hard delete) and a unique
+  `(tenant_id, code)`. A service type carries its own
+  `default_duration_minutes` and `buffer_before_minutes`/
+  `buffer_after_minutes`; there is deliberately no price/currency/billing
+  field.
+* `ProviderSchedule` + `ScheduleBreak` (`backend/app/models/provider_schedule.py`)
+  — a recurring weekly rule (`day_of_week` 0=Monday, matching
+  `datetime.weekday()`) with an effective date range and an optional room.
+  Overlap rejection for two rules of the same provider is **service-layer
+  only** (`ScheduleService._validate_no_overlap`), not a DB exclusion
+  constraint — combining a day-of-week recurrence with a date range and a
+  time range into one PostgreSQL exclusion constraint was judged not worth
+  the complexity for a foundation slice; this is a deliberate, documented
+  scope reduction, not an oversight. `ScheduleBreak` rows carry no
+  `tenant_id` of their own, scoping only through their parent schedule
+  (`ondelete=CASCADE`) — an intentional deviation from the "every table has
+  its own `tenant_id`" convention, since a break has no independent
+  existence outside its schedule.
+* `CalendarBlock` (`backend/app/models/calendar_block.py`) — an ad hoc
+  provider- and/or room-level block (leave, training, maintenance, ...)
+  that is never bookable over, checked by the same availability engine as
+  the recurring schedule.
+* `Appointment` (`backend/app/models/appointment.py`) — the booking record.
+  `status` (`scheduled`/`confirmed`/`cancelled`/`completed`/`no_show`),
+  `version` (optimistic-locking counter, starts at 1), and a denormalized
+  patient contact snapshot (`patient_display_name`/`patient_phone`/
+  `patient_email`) captured at booking time — there is no separate patient
+  record/profile in this slice, matching the "no patient data handling yet"
+  foundation-stage boundary.
+
+### Double-booking prevention: two layers, not one
+
+* **Service-layer pre-check** (`AvailabilityService.is_interval_free`) —
+  computed dynamically from the provider's recurring schedule, breaks,
+  active calendar blocks, and existing blocking appointments; never
+  materializes a slot as a database row. This is what a sequential
+  double-booking attempt hits, surfaced as `409 outside_schedule`.
+* **Database exclusion constraint** (the migration's
+  `ex_appointments_provider_overlap`/`ex_appointments_room_overlap`, using
+  PostgreSQL's `EXCLUDE USING gist` over `tstzrange(starts_at, ends_at,
+  '[)')`, requiring the `btree_gist` extension for the `uuid`/`varchar`
+  equality terms) is the **authoritative** layer: a genuine race between
+  two concurrent transactions that both pass the pre-check is caught here,
+  surfaced as `409 appointment_conflict` (`AppointmentService` maps the
+  constraint name from `IntegrityError.orig.diag.constraint_name` — never
+  by parsing the error message string). Verified end-to-end in
+  `tests/integration/test_appointment_concurrency.py` using two genuinely
+  independent database connections/threads, not a simulated sequential
+  call. Both exclusion constraints are scoped to `status IN ('scheduled',
+  'confirmed')` — a cancelled appointment never blocks a new booking.
+* **Half-open interval convention** (`[start, end)`) is used everywhere
+  (appointments, blocks, availability) — two bookings that only touch at a
+  boundary never conflict.
+
+### Buffer strategy — matches task.md exactly, not a gap
+
+A service type's `buffer_before_minutes`/`buffer_after_minutes` are
+absorbed into the availability engine's schedule-window shrinking during
+slot generation (the free interval is shrunk by the buffer before bookable
+slots are computed) — they are **not** persisted as separate
+`occupied_starts_at`/`occupied_ends_at` columns and are **not** part of the
+database exclusion constraint's own range. This was re-verified against
+`tasks/current/task.md`'s own "Domain model" section during the MED-005
+repair round: the task explicitly specifies the exclusion constraint over
+`tstzrange(starts_at, ends_at, '[)')` — the bare appointment interval, not
+a buffer-expanded one — and separately, explicitly documents that
+`CalendarBlock`-vs-`Appointment` conflict prevention (which buffers
+effectively extend) is service-layer only "not by a database constraint
+spanning both tables," with the residual race window called out as an
+explicit, accepted, product-acceptable limitation for this foundation
+slice. The current implementation is therefore a direct match for the
+governing spec, not a compromise against it — buffer-vs-buffer protection
+between two *concurrent* bookings is enforced only at the service-layer
+pre-check, by design.
+
+### Optimistic locking
+
+Every appointment mutation (reschedule, cancel, confirm, complete, no-show,
+metadata update) is a single `UPDATE ... WHERE id = :id AND tenant_id =
+:tenant_id AND version = :expected_version ... RETURNING *`
+(`AppointmentRepository.update_with_version`) — the database, not a prior
+Python-level read, is the sole arbiter of whether the caller's expected
+version still matches. A zero-row result is always `409 stale_version`.
+This is the first use of this pattern in the codebase, chosen over `SELECT
+... FOR UPDATE` specifically to avoid holding a row lock across a
+potentially slow availability recheck.
+
+### Status transitions and authorization
+
+* Allowed transitions: `scheduled → {confirmed, cancelled, completed,
+  no_show}`, `confirmed → {cancelled, completed, no_show}`; `cancelled`/
+  `completed`/`no_show` are terminal. Any other requested transition is
+  `409 invalid_status_transition`.
+* `cancel` is **idempotent** — cancelling an already-cancelled appointment
+  returns its current state rather than re-raising or re-auditing, so a
+  retried request (e.g. after a lost response) never surfaces as an error.
+* `complete`/`no_show` allow a **self-scoped bypass**: any active member
+  may always act on an appointment where they are the `provider_user_id`,
+  regardless of role — "provider" is a fact, not a permission grant.
+  `cancel`/`confirm`/`reschedule` have no such bypass and always require a
+  `CALENDAR_WRITE_ROLES` role, even for the appointment's own provider.
+  `update_metadata` (patient contact snapshot, notes) likewise has **no**
+  self-scoped bypass — being the appointment's own provider does not, by
+  itself, grant the right to edit its patient contact/notes fields; every
+  caller, including the provider, needs `CALENDAR_WRITE_ROLES` (fixed in
+  the MED-005 repair round; an earlier version incorrectly extended the
+  complete/no-show bypass to metadata updates too).
+* **Role matrix** (`backend/app/core/authorization.py`): `CALENDAR_READ_ROLES`
+  = owner/manager/operator/auditor; `CALENDAR_WRITE_ROLES` =
+  owner/manager/operator; `CALENDAR_CONFIG_ROLES` (rooms, service types,
+  schedules, calendar blocks) = owner/manager; `CALENDAR_OVERRIDE_ROLES`
+  (booking outside the computed availability, with a required
+  `override_reason`) = owner/manager; `CALENDAR_CONTACT_VISIBLE_ROLES`
+  (patient phone/email snapshot) = owner/manager/operator — `AUDITOR` may
+  read the calendar but never the patient contact snapshot
+  (`app.api.appointments._serialize` returns a redacted
+  `AppointmentSummaryRead` instead of `AppointmentRead`), and
+  `CONTENT_EDITOR` has no calendar permission at all in this slice.
+* **Availability self-scope**: `GET /api/v1/availability` is not gated by
+  `CALENDAR_READ_ROLES` alone — per task.md's authorization matrix ("View
+  own calendar (self as provider) | any active member (self-scoped
+  only)"), every active member may query availability for
+  `provider_id == their own user id` regardless of role;
+  `require_calendar_read_or_self` (`app.core.authorization`) is the
+  authoritative check, called from `AvailabilityService.get_availability`
+  itself, not just an API-layer dependency. Querying another provider's
+  availability still requires `CALENDAR_READ_ROLES`. (Fixed in the MED-005
+  repair round; an earlier version rejected every non-`CALENDAR_READ_ROLES`
+  caller outright, including for their own availability.)
+* **Conflict error codes** (`app.core.errors.CalendarConflictError`):
+  `appointment_conflict` (an existing blocking appointment overlaps —
+  provider or room), `provider_unavailable` (a `ProviderSchedule` rule
+  exists for that day, but the requested window falls outside its hours or
+  inside a break), `room_unavailable` (room inactive, or a room-scoped
+  `CalendarBlock` overlaps), `blocked_period` (a provider-scoped
+  `CalendarBlock` overlaps), `outside_schedule` (no `ProviderSchedule` rule
+  matches that day at all), `invalid_status_transition`, `stale_version` —
+  the full 7-code set task.md's "Error contract" section explicitly
+  requires (fixed in the MED-005 repair round; an earlier version
+  collapsed all four availability-related reasons into a single
+  `outside_schedule` code). `AvailabilityService.diagnose_unavailable_reason`
+  classifies the specific reason, in a fixed priority order (existing
+  appointment overlap → room state/block → provider block → no schedule
+  at all → schedule exists but doesn't cover this window), only ever
+  called after `is_interval_free` has already returned `False`. Sequential
+  double-bookings that the service-layer pre-check catches now report
+  `appointment_conflict` too — the same code the DB exclusion constraint
+  itself would raise for a genuine concurrent race — so a caller sees one
+  consistent code regardless of which layer caught it. Inactive-resource
+  (other than room) and not-found conditions use the existing plain
+  `ConflictError`/`NotFoundError` without a machine code.
+
+### DST handling
+
+`app.core.scheduling_time.combine_local` resolves a local
+date+time-of-day into a UTC instant for a given `ProviderSchedule`/
+`ScheduleBreak` row. A nonexistent local time (the spring-forward gap) is
+**skipped** for that occurrence, never silently shifted forward or
+backward; an ambiguous local time (the fall-back overlap) resolves to its
+**first** occurrence (`fold=0`). Both are documented, deliberate policy
+choices, covered by `tests/unit/test_scheduling_time.py` using the actual
+2026 EU DST transition dates.
+
+### API surface
+
+`GET/POST /api/v1/rooms`, `GET/POST /api/v1/appointment-service-types`,
+`GET/POST /api/v1/provider-schedules` (+ breaks), `GET/POST
+/api/v1/calendar-blocks`, `GET /api/v1/availability`, and the full
+`/api/v1/appointments` lifecycle (create, get, list, patch-metadata,
+reschedule, cancel, confirm, complete, no-show) — every mutating route
+behind `Depends(require_csrf)`, business-logic-in-routes forbidden (routes
+call a service method and serialize its return value only), and
+transaction ownership stays in the service layer throughout (repositories
+`flush()`, never `commit()`).
+
+### Frontend
+
+`frontend/app/calendar` — day **and week** view calendar with a view-mode
+toggle (date navigation, provider/room/status filters, appointment cards
+with role/self-scoped-aware action buttons, an inline creation form with an
+availability-driven slot picker, and an inline reschedule panel), plus
+`frontend/app/settings/{rooms,service-types,schedules,blocks}` for the
+configuration CRUD screens. Week view uses a Monday-based week start
+(`app/lib/calendar-time.ts`'s `startOfWeek`/`weekDates`/
+`localWeekBoundsUtc` — Bulgaria and most of Europe start the week on
+Monday, not Sunday like `Date.getDay()`/`Intl` default to), fetches the
+full 7-day range in one request, and groups results client-side by local
+calendar date (`localDateString`) — never 7 separate day requests. Every
+timestamp is parsed/rendered through `app/lib/calendar-time.ts` (offset-aware
+ISO parsing, tenant-timezone-aware `Intl` formatting, DST-safe local-day/
+local-week UTC bounds) — never a naive `new Date("...")` string-splice.
+Action visibility mirrors the backend role/self-scoped matrix in
+`app/lib/appointment-policy.ts` as a usability convenience only; the
+backend independently re-derives and
+enforces every rule regardless of what the UI shows or hides. `GET
+/api/v1/clinic` now additionally returns the tenant's `timezone` (added in
+this slice) so the frontend never has to guess it.
+
+### Known limitations
+
+* No practitioner-records module — a "provider" is any active
+  `TenantMembership` referenced by a schedule/appointment row; there is no
+  dedicated profile, specialty, or display-name concept, so the UI shows a
+  raw user id wherever a provider is referenced (consistent with the
+  existing MED-003 staff roster, which has the same limitation).
+* No patient-record storage beyond the per-appointment contact snapshot —
+  there is no searchable patient directory, and nothing in this slice
+  claims otherwise.
+* No notification delivery (appointment confirmations/reminders) — matches
+  the "no email delivery exists" limitation already documented for MED-004.
+* Buffer-vs-buffer and `CalendarBlock`-vs-`Appointment` race protection is
+  service-layer only, not database-enforced (see "Buffer strategy" above)
+  — this matches task.md's own explicit "Concurrency strategy" section
+  exactly (re-verified during the MED-005 repair round), not a deviation
+  from it.
+* Provider-schedule overlap rejection is service-layer only, not a database
+  exclusion constraint (see "Domain model" above) — a documented scope
+  reduction.
+
 ## Deterministic business services
 
-**[planned]** All business actions (creating an appointment, changing a
-schedule, applying a policy) are performed by deterministic, testable service
-functions in the backend — plain code with explicit inputs/outputs, not model
-inference. This applies once the `appointments`, `schedules`, and
-`policy-engine` modules exist.
+**[implemented — MED-005, partial]** `app.services.appointment_service`,
+`schedule_service`, `availability_service`, `room_service`,
+`service_type_service`, and `calendar_block_service` are the first
+deterministic, testable service functions with explicit inputs/outputs (not
+model inference) in this codebase — see "Appointments and calendar" above.
+The `policy-engine` module for more general business-policy evaluation
+remains **[planned]**.
 
 ## AI boundary
 
@@ -474,8 +715,7 @@ handing a conversation to a human operator without losing context.
 * `backend/` clinic and staff administration (MED-003) — clinic (tenant)
   settings view/edit and staff (membership) administration with the role
   matrix and final-owner invariant described in "Clinic and staff
-  administration" above. No other business module (practitioners,
-  appointments, ...) is implemented on top of it yet.
+  administration" above.
 * `backend/` production authentication (MED-004) — `UserAccount`/
   `AuthSession`/`OneTimeToken` models, Argon2id password hashing,
   server-side opaque sessions, session-tied CSRF double-submit,
@@ -483,14 +723,23 @@ handing a conversation to a human operator without losing context.
   described in "Authentication and user identity" above. `get_tenant_context`
   now resolves a real session before falling back to the development
   identity provider.
+* `backend/` appointments and calendar foundation (MED-005) — rooms,
+  service types, provider schedules (+ breaks), calendar blocks, the
+  dynamic availability engine, and the full appointment lifecycle
+  (optimistic locking, dual-layer double-booking prevention, DST-aware
+  scheduling) described in "Appointments and calendar" above. No
+  dedicated practitioner-records, billing, or notification module is
+  implemented on top of it yet.
 * `frontend/` — Next.js App Router shell with a landing page that displays
   backend health status, `/login`, `/forgot-password`, `/reset-password`,
   `/select-clinic`, and `/invitations/accept` for the authentication flow,
-  plus `/settings/clinic`, `/settings/staff`, and `/settings/security`
-  (authenticated change-password) — all session-authenticated
-  (`app/lib/api.ts`), with the development identity picker (and its
-  `/dev/identity` entry point) retained as a local-testing convenience
-  only and never rendered/reachable in a production build.
+  `/settings/clinic`, `/settings/staff`, and `/settings/security`
+  (authenticated change-password), `/calendar` and
+  `/settings/{rooms,service-types,schedules,blocks}` for the MED-005
+  scheduling UI — all session-authenticated (`app/lib/api.ts`), with the
+  development identity picker (and its `/dev/identity` entry point)
+  retained as a local-testing convenience only and never rendered/reachable
+  in a production build.
 * `infra/` — Docker Compose definitions for Postgres, Redis, Qdrant, backend,
   frontend.
 
@@ -500,16 +749,17 @@ handing a conversation to a human operator without losing context.
 |----------------|------------------------------------------------------------------|
 | authentication | User/staff login, session management (implemented — see "Authentication and user identity"); MFA/SSO still planned |
 | clinics        | Clinic settings + staff/membership administration (implemented — see "Clinic and staff administration") |
-| practitioners  | Clinical practitioner records and scheduling roles (distinct from staff/membership administration above) |
-| services       | Billable clinical services offered by a clinic                    |
-| schedules      | Practitioner availability and working hours                       |
-| appointments   | Booking, rescheduling, cancellation (deterministic service layer) |
+| practitioners  | Clinical practitioner records/profiles (distinct from the "provider" fact used by MED-005 scheduling — see "Appointments and calendar" "Known limitations") |
+| services       | Billable clinical services offered by a clinic (implemented as non-billable `AppointmentServiceType` configuration — see "Appointments and calendar"; no price/currency/billing field exists) |
+| schedules      | Provider availability and working hours (implemented — see "Appointments and calendar") |
+| appointments   | Booking, rescheduling, cancellation (implemented — see "Appointments and calendar") |
 | knowledge base | Clinic-specific FAQ / policy content for AI-assisted responses    |
 | conversations  | Patient/staff conversational sessions, human handover              |
-| policy engine  | Deterministic evaluation of business/booking policies               |
+| policy engine  | Deterministic evaluation of business/booking policies (the appointment/schedule services above are the first deterministic service functions — see "Deterministic business services") |
 | notifications  | Email/SMS/push delivery for appointment and account events         |
 | audit          | Immutable, persistent audit log (an interim structured-logging adapter exists — see "Audit-event flow" above) |
 | analytics      | Aggregated, tenant-scoped operational reporting                    |
 
-No module above has been implemented. Do not add business logic to `backend/`
-until a module is explicitly scoped and approved as separate work.
+No module marked purely "planned" above has been implemented. Do not add
+business logic to `backend/` until a module is explicitly scoped and
+approved as separate work.

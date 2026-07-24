@@ -36,6 +36,11 @@ begins.
   see `ARCHITECTURE.md` → "Authentication and user identity" and the
   "Authentication threat model" section below. MFA and SSO are still
   **[planned]**.
+* **[implemented — MED-005]** Appointments and calendar role matrix
+  (`CALENDAR_READ_ROLES`/`CALENDAR_WRITE_ROLES`/`CALENDAR_CONFIG_ROLES`/
+  `CALENDAR_OVERRIDE_ROLES`/`CALENDAR_CONTACT_VISIBLE_ROLES`) — see
+  `ARCHITECTURE.md` → "Appointments and calendar" and the "Appointments
+  and calendar threat model" section below.
 
 ## Tenant-boundary threat model
 
@@ -216,6 +221,75 @@ begins.
 * Any new tenant-owned resource or route must add the equivalent
   isolation, role-matrix, and audit-event tests before merging — do not
   rely on manual testing for this class of bug.
+
+## Appointments and calendar threat model (MED-005)
+
+* **Threat: double-booking via a race between two concurrent requests.**
+  Mitigated in two layers: a service-layer availability pre-check (racy by
+  itself, since it reads without locking), backed by an authoritative
+  PostgreSQL exclusion constraint (`ex_appointments_provider_overlap`/
+  `ex_appointments_room_overlap`, `EXCLUDE USING gist` over `tstzrange`)
+  that is the actual guarantee — verified with two genuinely independent
+  database connections/threads in
+  `backend/tests/integration/test_appointment_concurrency.py`, not a
+  simulated sequential call. See `ARCHITECTURE.md` → "Appointments and
+  calendar" → "Double-booking prevention: two layers, not one".
+* **Threat: lost-update on appointment mutation (two staff members editing
+  the same appointment concurrently).** Mitigated by optimistic locking
+  (`Appointment.version`, enforced by a single atomic `UPDATE ... WHERE
+  ... AND version = :expected_version`) — a stale write is rejected with
+  `409 stale_version`, never silently overwritten.
+* **Threat: patient contact data exposure to a role that shouldn't see
+  it.** `AUDITOR` may read the calendar (appointment existence, timing,
+  status) but the patient contact snapshot (phone/email) is redacted at
+  serialization (`app.api.appointments._serialize` returns
+  `AppointmentSummaryRead`, which has no phone/email fields at all, rather
+  than a `null`-filled `AppointmentRead`) for any role outside
+  `CALENDAR_CONTACT_VISIBLE_ROLES` who is not the appointment's own
+  provider. `CONTENT_EDITOR` has no calendar access at all.
+* **Threat: an appointment's own provider editing its patient contact
+  snapshot/notes without a write role.** `AppointmentService.update_metadata`
+  has **no** self-scoped bypass — unlike `complete`/`no_show`, being the
+  appointment's provider does not itself grant metadata-edit rights; every
+  caller needs `CALENDAR_WRITE_ROLES` (fixed in the MED-005 repair round —
+  an earlier version incorrectly extended the complete/no-show bypass to
+  metadata edits too, which would have let e.g. an `AUDITOR` acting as
+  their own appointment's provider rewrite the patient's phone/email).
+  Regression-tested in
+  `backend/tests/integration/test_appointments_api.py` (self-provider
+  without a write role gets `403`).
+* **Threat: over-restrictive availability lookup blocking legitimate
+  self-service.** `GET /api/v1/availability` allows any active member to
+  query availability for themselves as the provider
+  (`require_calendar_read_or_self`), regardless of role — task.md's
+  authorization matrix requires this self-scope carve-out; an earlier
+  version incorrectly rejected every caller outside `CALENDAR_READ_ROLES`
+  even for their own schedule (fixed in the MED-005 repair round). The
+  self-scope comparison is always against the server-resolved
+  `TenantContext.user_id`, never a client-supplied claim — a caller cannot
+  spoof another provider's identity via the `provider_id` query parameter
+  to gain that provider's availability view.
+* **Threat: booking outside a provider's authorized availability going
+  unnoticed.** The `override_availability` escape hatch is restricted to
+  `CALENDAR_OVERRIDE_ROLES` (owner/manager) only, requires a non-empty
+  `override_reason`, and always emits a distinct `appointment.override_used`
+  audit event in addition to the normal `appointment.created`/
+  `appointment.rescheduled` event — an override is never silent.
+* **Threat: unbounded query ranges used for denial-of-service or excessive
+  data exposure.** `GET /api/v1/availability` and `GET
+  /api/v1/calendar-blocks` both reject a `date_from`/`date_to` range wider
+  than 31 days (`409 Conflict`) — there is no unbounded "give me everything"
+  query path.
+* **Threat: booking a stale/inactive resource (deactivated room, service
+  type, or staff membership).** Every create/reschedule call re-validates
+  the provider's membership, the service type, and the room (if any) are
+  `active` at the time of the call — a resource deactivated after an
+  appointment was created is not retroactively affected, but no NEW
+  booking or reschedule can be made against an inactive one.
+* **Tenant isolation** follows the same pattern as every other MED-003+
+  module: every repository method scopes by `tenant_id` in one query (see
+  "Tenant-boundary threat model" above) — cross-tenant appointment/room/
+  schedule/block access returns the same 404 as a nonexistent id.
 
 ## Logging
 
