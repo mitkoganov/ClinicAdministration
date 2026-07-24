@@ -588,8 +588,9 @@ function AppointmentCard({
       <div>Provider: {appointment.provider_user_id}</div>
       <div>Room: {roomName}</div>
       <div>Service: {serviceTypeName}</div>
-      <div>Patient: {appointment.patient_display_name ?? "(hidden for your role)"}</div>
+      <div>Patient: {appointment.patient_display_name}</div>
       {appointment.patient_phone !== undefined && appointment.patient_phone && <div>Phone: {appointment.patient_phone}</div>}
+      {appointment.patient_phone === undefined && <div style={{ opacity: 0.7 }}>Contact details hidden for your role.</div>}
       {appointment.notes && <div>Notes: {appointment.notes}</div>}
       {appointment.cancellation_reason && <div>Cancellation reason: {appointment.cancellation_reason}</div>}
 

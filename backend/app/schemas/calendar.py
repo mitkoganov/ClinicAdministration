@@ -284,7 +284,12 @@ class AppointmentRead(BaseModel):
 
 class AppointmentSummaryRead(BaseModel):
     """Redacted view for roles that may see the calendar but not the
-    patient contact snapshot (see task.md "Patient contact visibility")."""
+    patient contact snapshot (see task.md "Patient contact visibility").
+    Redaction is field-level, not row-level: `patient_display_name` (and
+    `notes` - task.md documents these as "operational scheduling notes,
+    never clinical/medical notes") stay visible so the appointment
+    remains identifiable in a calendar view; only `patient_phone`/
+    `patient_email` are omitted."""
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -295,6 +300,8 @@ class AppointmentSummaryRead(BaseModel):
     starts_at: datetime
     ends_at: datetime
     status: AppointmentStatus
+    patient_display_name: str
+    notes: str | None
     version: int
     created_at: datetime
     updated_at: datetime
@@ -328,7 +335,17 @@ class AppointmentMetadataUpdate(BaseModel):
     """Deliberately does NOT accept `status` - status transitions only
     ever happen through the explicit action endpoints (confirm/cancel/
     complete/no-show/reschedule), never through this generic patch, so a
-    client can never smuggle a status change through here."""
+    client can never smuggle a status change through here.
+
+    Omitted-vs-explicit-null: every field here is optional so a caller
+    can change just one without resending the others - `model_fields_set`
+    (checked by `AppointmentService.update_metadata`, not this schema)
+    is what distinguishes "omitted, leave unchanged" from "explicitly
+    `null`, clear it" for `patient_phone`/`patient_email`/`notes`/
+    `room_id`, all nullable on the `Appointment` model itself.
+    `patient_display_name` is the one exception - it is NOT nullable on
+    the model, so an explicit `null` for it is a validation error, not a
+    clear request (see `_reject_null_display_name` below)."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -337,6 +354,21 @@ class AppointmentMetadataUpdate(BaseModel):
     patient_phone: str | None = None
     patient_email: str | None = None
     notes: str | None = Field(default=None, max_length=2000)
+    room_id: uuid.UUID | None = None
+
+    @model_validator(mode="after")
+    def _reject_null_display_name(self) -> "AppointmentMetadataUpdate":
+        if "patient_display_name" in self.model_fields_set and self.patient_display_name is None:
+            raise ValueError(
+                "patient_display_name cannot be cleared (it is required, not nullable)."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _require_at_least_one_metadata_field(self) -> "AppointmentMetadataUpdate":
+        if not (self.model_fields_set - {"expected_version"}):
+            raise ValueError("At least one metadata field must be provided.")
+        return self
 
 
 class AppointmentRescheduleRequest(BaseModel):

@@ -1,4 +1,5 @@
 import uuid
+from collections.abc import Set as AbstractSet
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy.exc import IntegrityError
@@ -137,22 +138,34 @@ class AppointmentService:
         appointment_id: uuid.UUID,
         expected_version: int,
         *,
+        fields_set: AbstractSet[str],
         patient_display_name: str | None = None,
         patient_phone: str | None = None,
         patient_email: str | None = None,
         notes: str | None = None,
+        room_id: uuid.UUID | None = None,
     ) -> Appointment:
-        """Non-status metadata only (patient contact snapshot, notes) -
-        status transitions never go through here, only through the
-        explicit action methods above (see
+        """Non-status metadata only (patient contact snapshot, notes,
+        room) - status transitions never go through here, only through
+        the explicit action methods above (see
         app.schemas.calendar.AppointmentMetadataUpdate's docstring).
+
+        `fields_set` (the schema's `model_fields_set`, minus
+        `expected_version`) is what distinguishes "omitted, leave
+        unchanged" from "explicitly `None`, clear it" for
+        `patient_phone`/`patient_email`/`notes`/`room_id` - a plain
+        `if value is not None` filter (the previous implementation)
+        cannot tell those two cases apart, so a caller could never clear
+        an already-set phone/email/notes/room. `patient_display_name`
+        cannot be cleared this way (rejected at the schema layer, since
+        it is not nullable on the model) but CAN be omitted.
 
         Deliberately NO self-scoped bypass: task.md's authorization
         matrix grants a self-scoped bypass only for `complete`/`no_show`
         (see `_transition`'s `allow_self_scoped` parameter) - being the
         appointment's own provider does not, by itself, grant the right
-        to edit the patient contact snapshot or notes. Every caller,
-        including the provider, needs `CALENDAR_WRITE_ROLES`."""
+        to edit the patient contact snapshot, notes, or room. Every
+        caller, including the provider, needs `CALENDAR_WRITE_ROLES`."""
         existing = self._repo.get_by_id(context.tenant_id, appointment_id)
         if existing is None:
             self._audit(
@@ -162,29 +175,93 @@ class AppointmentService:
 
         try:
             require_role(context, CALENDAR_WRITE_ROLES)
-        except ForbiddenError:
+
+            values: dict[str, object] = {}
+            if "patient_display_name" in fields_set:
+                # The schema already rejects an explicit `null` here (see
+                # AppointmentMetadataUpdate._reject_null_display_name) -
+                # this is always a non-empty string at this point, per
+                # the schema's own min_length=1, but never trust a
+                # not-yet-stripped value the same way `create()` doesn't.
+                if patient_display_name is None or not patient_display_name.strip():
+                    raise ConflictError("patient_display_name cannot be blank.")
+                values["patient_display_name"] = patient_display_name.strip()
+            if "patient_phone" in fields_set:
+                values["patient_phone"] = patient_phone
+            if "patient_email" in fields_set:
+                values["patient_email"] = patient_email
+            if "notes" in fields_set:
+                values["notes"] = notes
+            if "room_id" in fields_set:
+                if room_id is not None:
+                    room = self._rooms.get_by_id(context.tenant_id, room_id)
+                    if room is None:
+                        raise NotFoundError("Room not found in this clinic.")
+                    if room.status != ClinicRoomStatus.ACTIVE:
+                        raise _unavailability_error("room_unavailable")
+
+                    service_type = self._service_types.get_by_id(
+                        context.tenant_id, existing.service_type_id
+                    )
+                    if service_type is None:
+                        raise NotFoundError("Service type not found in this clinic.")
+                    tenant = self._tenants.get_by_id(context.tenant_id)
+                    if tenant is None:
+                        raise NotFoundError()
+
+                    buffer_before = timedelta(minutes=service_type.buffer_before_minutes)
+                    buffer_after = timedelta(minutes=service_type.buffer_after_minutes)
+                    available = self._availability.is_interval_free(
+                        context.tenant_id,
+                        tenant.timezone,
+                        provider_user_id=existing.provider_user_id,
+                        room_id=room_id,
+                        starts_at=existing.starts_at,
+                        ends_at=existing.ends_at,
+                        buffer_before=buffer_before,
+                        buffer_after=buffer_after,
+                        exclude_appointment_id=existing.id,
+                    )
+                    if not available:
+                        reason = self._availability.diagnose_unavailable_reason(
+                            context.tenant_id,
+                            tenant.timezone,
+                            provider_user_id=existing.provider_user_id,
+                            room_id=room_id,
+                            starts_at=existing.starts_at,
+                            ends_at=existing.ends_at,
+                            buffer_before=buffer_before,
+                            buffer_after=buffer_after,
+                            exclude_appointment_id=existing.id,
+                        )
+                        raise _unavailability_error(reason)
+                values["room_id"] = room_id
+        except (ForbiddenError, ConflictError, NotFoundError):
             self._audit(
                 context, "appointment.metadata_updated", AuditOutcome.REJECTED, appointment_id
             )
             raise
 
-        values = {
-            k: v
-            for k, v in {
-                "patient_display_name": patient_display_name,
-                "patient_phone": patient_phone,
-                "patient_email": patient_email,
-                "notes": notes,
-            }.items()
-            if v is not None
-        }
-        updated = self._repo.update_with_version(
-            context.tenant_id,
-            appointment_id,
-            expected_version,
-            updated_by_user_id=context.user_id,
-            values=values,
-        )
+        try:
+            updated = self._repo.update_with_version(
+                context.tenant_id,
+                appointment_id,
+                expected_version,
+                updated_by_user_id=context.user_id,
+                values=values,
+            )
+        except IntegrityError as exc:
+            self._db.rollback()
+            constraint = _overlap_constraint_name(exc)
+            if constraint not in (_PROVIDER_OVERLAP_CONSTRAINT, _ROOM_OVERLAP_CONSTRAINT):
+                raise
+            self._audit(
+                context, "appointment.metadata_updated", AuditOutcome.REJECTED, appointment_id
+            )
+            raise CalendarConflictError(
+                "This time conflicts with another appointment.", code="appointment_conflict"
+            ) from exc
+
         if updated is None:
             self._audit(
                 context, "appointment.metadata_updated", AuditOutcome.REJECTED, appointment_id

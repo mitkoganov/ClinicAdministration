@@ -241,12 +241,28 @@ begins.
   `409 stale_version`, never silently overwritten.
 * **Threat: patient contact data exposure to a role that shouldn't see
   it.** `AUDITOR` may read the calendar (appointment existence, timing,
-  status) but the patient contact snapshot (phone/email) is redacted at
-  serialization (`app.api.appointments._serialize` returns
-  `AppointmentSummaryRead`, which has no phone/email fields at all, rather
-  than a `null`-filled `AppointmentRead`) for any role outside
-  `CALENDAR_CONTACT_VISIBLE_ROLES` who is not the appointment's own
-  provider. `CONTENT_EDITOR` has no calendar access at all.
+  status, `patient_display_name`) but the patient contact snapshot
+  (phone/email specifically) is redacted at serialization
+  (`app.api.appointments._serialize` returns `AppointmentSummaryRead`,
+  which omits `patient_phone`/`patient_email` entirely rather than a
+  `null`-filled `AppointmentRead`) for any role outside
+  `CALENDAR_CONTACT_VISIBLE_ROLES`. `CONTENT_EDITOR` has no calendar
+  access at all. `_serialize` is the SINGLE place every appointment
+  response (read, list, create, metadata update, reschedule, every
+  lifecycle action) goes through — no route may call
+  `AppointmentRead.model_validate(...)` directly, which would bypass
+  this policy for whichever endpoint did it (fixed in a second MED-005
+  repair round: an earlier version had exactly two such bypasses —
+  (1) `_serialize` itself granted full contact visibility whenever the
+  caller happened to be the appointment's own provider, regardless of
+  role, so an `AUDITOR` acting as their own appointment's provider saw
+  full phone/email; (2) the redacted schema additionally omitted
+  `patient_display_name`/`notes` entirely, which over-redacted — the
+  task requires only the contact snapshot to be hidden, not the
+  appointment's own identifiability in a calendar view. Both are
+  regression-tested in `backend/tests/integration/test_appointments_api.py`
+  — e.g. `test_auditor_provider_still_does_not_see_own_appointment_contact_info`
+  and `test_auditor_sees_redacted_summary_not_contact_info`).
 * **Threat: an appointment's own provider editing its patient contact
   snapshot/notes without a write role.** `AppointmentService.update_metadata`
   has **no** self-scoped bypass — unlike `complete`/`no_show`, being the
@@ -269,6 +285,24 @@ begins.
   `TenantContext.user_id`, never a client-supplied claim — a caller cannot
   spoof another provider's identity via the `provider_id` query parameter
   to gain that provider's availability view.
+* **Threat: metadata PATCH unable to clear previously-set PII, or
+  silently smuggling a room change past validation.** `AppointmentMetadataUpdate`
+  distinguishes "field omitted" from "field explicitly `null`" via
+  Pydantic's `model_fields_set` (not a plain `if value is not None`
+  filter, which cannot tell the two apart) — a caller can clear
+  `patient_phone`/`patient_email`/`notes`/`room_id` by sending an
+  explicit `null`, while an omitted field is left untouched (fixed in a
+  second MED-005 repair round: an earlier version filtered out every
+  `None` value unconditionally, so a previously-set phone/email/notes
+  could never be removed). `room_id` changes go through the same
+  tenant/active-room/availability validation as `POST`/`reschedule`
+  (never a bare column write) — an inactive room is `409
+  room_unavailable`, a cross-tenant room is `404`, and a genuinely
+  occupied room/time is `409 appointment_conflict`/`outside_schedule`
+  via the same `AvailabilityService`/DB-exclusion-constraint pair
+  documented above, not a separate, weaker check.
+  `patient_display_name` cannot be cleared (rejected at the schema
+  layer with `422`) since it is not nullable on the `Appointment` model.
 * **Threat: booking outside a provider's authorized availability going
   unnoticed.** The `override_availability` escape hatch is restricted to
   `CALENDAR_OVERRIDE_ROLES` (owner/manager) only, requires a non-empty

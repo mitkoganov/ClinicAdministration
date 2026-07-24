@@ -16,11 +16,22 @@ def _near_future_window(minutes_ahead: int = 10, duration_minutes: int = 30):
     return starts_at, ends_at
 
 
-def _create_payload(calendar_tenancy, *, minutes_ahead=10, provider_user_id=None, room_id=None):
+# Distinct from `None`, which now means "explicitly no room" - callers
+# that don't pass `room_id` at all get calendar_tenancy.room_a by
+# default (the pre-existing behavior every other test in this file
+# relies on), while `room_id=None` lets a test explicitly request an
+# unassigned-room appointment.
+_USE_DEFAULT_ROOM = object()
+
+
+def _create_payload(
+    calendar_tenancy, *, minutes_ahead=10, provider_user_id=None, room_id=_USE_DEFAULT_ROOM
+):
     starts_at, ends_at = _near_future_window(minutes_ahead)
+    resolved_room_id = calendar_tenancy.room_a.id if room_id is _USE_DEFAULT_ROOM else room_id
     return {
         "provider_user_id": str(provider_user_id or calendar_tenancy.tenancy.owner_a),
-        "room_id": str(room_id) if room_id else str(calendar_tenancy.room_a.id),
+        "room_id": str(resolved_room_id) if resolved_room_id else None,
         "service_type_id": str(calendar_tenancy.service_type_a.id),
         "starts_at": starts_at.isoformat(),
         "ends_at": ends_at.isoformat(),
@@ -68,6 +79,71 @@ def test_auditor_sees_redacted_summary_not_contact_info(client, calendar_tenancy
     assert "patient_phone" not in body
     assert "patient_email" not in body
     assert body["status"] == "scheduled"
+    # Redaction is field-level, not row-level: the appointment must stay
+    # identifiable in a calendar view even for a non-contact-visible role.
+    assert body["patient_display_name"] == "Ivan Ivanov"
+
+
+def test_auditor_provider_still_does_not_see_own_appointment_contact_info(
+    client, calendar_tenancy, db_session
+):
+    # Regression for the Codex finding: being the appointment's own
+    # provider must NOT bypass contact-field redaction. auditor_a is not
+    # in CALENDAR_CONTACT_VISIBLE_ROLES; make them the appointment's
+    # provider directly via the DB to exercise this specific case.
+    from app.models.appointment import Appointment
+
+    tenancy = calendar_tenancy.tenancy
+    created = _create(client, calendar_tenancy, tenancy.owner_a, minutes_ahead=16).json()
+    row = db_session.get(Appointment, uuid.UUID(created["id"]))
+    row.provider_user_id = tenancy.auditor_a
+    db_session.flush()
+
+    response = client.get(
+        f"{APPOINTMENTS_URL}/{created['id']}",
+        headers=dev_headers(tenancy.auditor_a, tenancy.tenant_a.id),
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert "patient_phone" not in body
+    assert "patient_email" not in body
+    assert body["patient_display_name"] == "Ivan Ivanov"
+
+
+def test_content_editor_list_sees_redacted_summary_with_display_name(
+    client, calendar_tenancy, db_session
+):
+    # CONTENT_EDITOR is not in CALENDAR_READ_ROLES, so list() silently
+    # narrows to their own appointments as provider (task.md's universal
+    # self-view fact) - reassign an existing appointment's provider to
+    # exercise that path with the same redaction guarantee.
+    from app.models.appointment import Appointment
+
+    tenancy = calendar_tenancy.tenancy
+    created = _create(client, calendar_tenancy, tenancy.owner_a, minutes_ahead=17).json()
+    row = db_session.get(Appointment, uuid.UUID(created["id"]))
+    row.provider_user_id = tenancy.content_editor_a
+    db_session.flush()
+
+    response = client.get(
+        APPOINTMENTS_URL, headers=dev_headers(tenancy.content_editor_a, tenancy.tenant_a.id)
+    )
+    assert response.status_code == 200
+    items = response.json()["items"]
+    assert len(items) >= 1
+    for item in items:
+        assert "patient_phone" not in item
+        assert "patient_email" not in item
+        assert item["patient_display_name"]
+
+
+def test_owner_create_response_includes_contact_details(client, calendar_tenancy):
+    tenancy = calendar_tenancy.tenancy
+    response = _create(client, calendar_tenancy, tenancy.owner_a, minutes_ahead=18)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["patient_phone"] == "+359881234567"
+    assert body["patient_email"] == "ivan@example.com"
 
 
 def test_sequential_provider_overlap_is_rejected_by_pre_check(client, calendar_tenancy):
@@ -399,6 +475,35 @@ def test_no_show_transitions_scheduled_directly(client, calendar_tenancy, db_ses
     assert response.json()["status"] == "no_show"
 
 
+def test_complete_response_redacts_contact_for_self_provider_without_contact_role(
+    client, calendar_tenancy, db_session
+):
+    # complete/no-show grant a self-scoped ACTION bypass (any active
+    # member may complete their own appointment), but that must never
+    # imply a contact-visibility bypass too - the response itself must
+    # still be redacted for a provider outside CALENDAR_CONTACT_VISIBLE_ROLES.
+    from app.models.appointment import Appointment
+
+    tenancy = calendar_tenancy.tenancy
+    created = _create(client, calendar_tenancy, tenancy.owner_a, minutes_ahead=1100).json()
+    row = db_session.get(Appointment, uuid.UUID(created["id"]))
+    row.provider_user_id = tenancy.auditor_a
+    row.starts_at = datetime.now(UTC) - timedelta(minutes=5)
+    db_session.flush()
+
+    response = client.post(
+        f"{APPOINTMENTS_URL}/{created['id']}/complete",
+        json={"expected_version": created["version"]},
+        headers=dev_headers(tenancy.auditor_a, tenancy.tenant_a.id),
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "completed"
+    assert "patient_phone" not in body
+    assert "patient_email" not in body
+    assert body["patient_display_name"] == "Ivan Ivanov"
+
+
 def test_invalid_transition_from_cancelled_is_rejected(client, calendar_tenancy):
     tenancy = calendar_tenancy.tenancy
     created = _create(client, calendar_tenancy, tenancy.owner_a, minutes_ahead=500).json()
@@ -565,8 +670,11 @@ def test_metadata_update_stale_version_is_rejected(client, calendar_tenancy):
 
 def test_metadata_update_schema_rejects_lifecycle_fields(client, calendar_tenancy):
     # AppointmentMetadataUpdate uses extra="forbid" - status/starts_at/
-    # room_id/etc. are not accepted fields at all (they only ever change
-    # through the explicit action/reschedule endpoints).
+    # provider_user_id/etc. are not accepted fields at all (they only
+    # ever change through the explicit action/reschedule endpoints).
+    # room_id IS an accepted metadata field (task.md explicitly scopes
+    # PATCH to "patient contact snapshot, notes, room") - see the
+    # dedicated room_id tests below.
     tenancy = calendar_tenancy.tenancy
     created = _create(client, calendar_tenancy, tenancy.owner_a, minutes_ahead=1160).json()
     response = client.patch(
@@ -575,3 +683,323 @@ def test_metadata_update_schema_rejects_lifecycle_fields(client, calendar_tenanc
         headers=dev_headers(tenancy.owner_a, tenancy.tenant_a.id),
     )
     assert response.status_code == 422
+
+
+def test_metadata_update_schema_rejects_starts_at_and_provider(client, calendar_tenancy):
+    tenancy = calendar_tenancy.tenancy
+    created = _create(client, calendar_tenancy, tenancy.owner_a, minutes_ahead=1165).json()
+    for field, value in (
+        ("starts_at", "2030-01-01T09:00:00+00:00"),
+        ("provider_user_id", str(tenancy.operator_a)),
+    ):
+        response = client.patch(
+            f"{APPOINTMENTS_URL}/{created['id']}",
+            json={"expected_version": created["version"], field: value},
+            headers=dev_headers(tenancy.owner_a, tenancy.tenant_a.id),
+        )
+        assert response.status_code == 422, f"field {field} should be rejected"
+
+
+def test_metadata_update_empty_payload_is_rejected(client, calendar_tenancy):
+    tenancy = calendar_tenancy.tenancy
+    created = _create(client, calendar_tenancy, tenancy.owner_a, minutes_ahead=1166).json()
+    response = client.patch(
+        f"{APPOINTMENTS_URL}/{created['id']}",
+        json={"expected_version": created["version"]},
+        headers=dev_headers(tenancy.owner_a, tenancy.tenant_a.id),
+    )
+    assert response.status_code == 422
+
+
+def test_metadata_update_null_display_name_is_rejected(client, calendar_tenancy):
+    tenancy = calendar_tenancy.tenancy
+    created = _create(client, calendar_tenancy, tenancy.owner_a, minutes_ahead=1167).json()
+    response = client.patch(
+        f"{APPOINTMENTS_URL}/{created['id']}",
+        json={"expected_version": created["version"], "patient_display_name": None},
+        headers=dev_headers(tenancy.owner_a, tenancy.tenant_a.id),
+    )
+    assert response.status_code == 422
+
+
+# --- update_metadata omitted-vs-explicit-null semantics --------------------
+
+
+def test_metadata_update_omitted_fields_stay_unchanged(client, calendar_tenancy):
+    tenancy = calendar_tenancy.tenancy
+    created = _create(client, calendar_tenancy, tenancy.owner_a, minutes_ahead=1170).json()
+    assert created["patient_phone"] == "+359881234567"
+    assert created["patient_email"] == "ivan@example.com"
+
+    response = client.patch(
+        f"{APPOINTMENTS_URL}/{created['id']}",
+        json={"expected_version": created["version"], "notes": "Only notes changed"},
+        headers=dev_headers(tenancy.owner_a, tenancy.tenant_a.id),
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["notes"] == "Only notes changed"
+    assert body["patient_phone"] == "+359881234567"
+    assert body["patient_email"] == "ivan@example.com"
+    assert body["room_id"] == created["room_id"]
+
+
+def test_metadata_update_explicit_null_clears_phone(client, calendar_tenancy):
+    tenancy = calendar_tenancy.tenancy
+    created = _create(client, calendar_tenancy, tenancy.owner_a, minutes_ahead=1171).json()
+    response = client.patch(
+        f"{APPOINTMENTS_URL}/{created['id']}",
+        json={"expected_version": created["version"], "patient_phone": None},
+        headers=dev_headers(tenancy.owner_a, tenancy.tenant_a.id),
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["patient_phone"] is None
+    assert body["patient_email"] == "ivan@example.com"
+
+
+def test_metadata_update_explicit_null_clears_email(client, calendar_tenancy):
+    tenancy = calendar_tenancy.tenancy
+    created = _create(client, calendar_tenancy, tenancy.owner_a, minutes_ahead=1172).json()
+    response = client.patch(
+        f"{APPOINTMENTS_URL}/{created['id']}",
+        json={"expected_version": created["version"], "patient_email": None},
+        headers=dev_headers(tenancy.owner_a, tenancy.tenant_a.id),
+    )
+    assert response.status_code == 200
+    assert response.json()["patient_email"] is None
+
+
+def test_metadata_update_explicit_null_clears_notes(client, calendar_tenancy):
+    tenancy = calendar_tenancy.tenancy
+    created = _create(client, calendar_tenancy, tenancy.owner_a, minutes_ahead=1173)
+    created = created.json()
+    first = client.patch(
+        f"{APPOINTMENTS_URL}/{created['id']}",
+        json={"expected_version": created["version"], "notes": "Has notes"},
+        headers=dev_headers(tenancy.owner_a, tenancy.tenant_a.id),
+    ).json()
+    assert first["notes"] == "Has notes"
+
+    response = client.patch(
+        f"{APPOINTMENTS_URL}/{created['id']}",
+        json={"expected_version": first["version"], "notes": None},
+        headers=dev_headers(tenancy.owner_a, tenancy.tenant_a.id),
+    )
+    assert response.status_code == 200
+    assert response.json()["notes"] is None
+
+
+def test_metadata_update_clears_phone_email_notes_simultaneously(client, calendar_tenancy):
+    tenancy = calendar_tenancy.tenancy
+    created = _create(client, calendar_tenancy, tenancy.owner_a, minutes_ahead=1174).json()
+    response = client.patch(
+        f"{APPOINTMENTS_URL}/{created['id']}",
+        json={
+            "expected_version": created["version"],
+            "patient_phone": None,
+            "patient_email": None,
+            "notes": None,
+        },
+        headers=dev_headers(tenancy.owner_a, tenancy.tenant_a.id),
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["patient_phone"] is None
+    assert body["patient_email"] is None
+    assert body["notes"] is None
+    assert body["patient_display_name"] == "Ivan Ivanov"
+
+
+def test_metadata_update_version_increments_exactly_once(client, calendar_tenancy):
+    tenancy = calendar_tenancy.tenancy
+    created = _create(client, calendar_tenancy, tenancy.owner_a, minutes_ahead=1175).json()
+    response = client.patch(
+        f"{APPOINTMENTS_URL}/{created['id']}",
+        json={"expected_version": created["version"], "notes": "v2"},
+        headers=dev_headers(tenancy.owner_a, tenancy.tenant_a.id),
+    )
+    assert response.status_code == 200
+    assert response.json()["version"] == created["version"] + 1
+
+
+# --- update_metadata room_id set/change/clear -------------------------------
+
+
+def test_metadata_update_sets_room_id(client, calendar_tenancy):
+    tenancy = calendar_tenancy.tenancy
+    created = _create(
+        client, calendar_tenancy, tenancy.owner_a, minutes_ahead=1180, room_id=None
+    ).json()
+    assert created["room_id"] is None
+
+    response = client.patch(
+        f"{APPOINTMENTS_URL}/{created['id']}",
+        json={"expected_version": created["version"], "room_id": str(calendar_tenancy.room_a.id)},
+        headers=dev_headers(tenancy.owner_a, tenancy.tenant_a.id),
+    )
+    assert response.status_code == 200
+    assert response.json()["room_id"] == str(calendar_tenancy.room_a.id)
+
+
+def test_metadata_update_clears_room_id(client, calendar_tenancy):
+    tenancy = calendar_tenancy.tenancy
+    created = _create(client, calendar_tenancy, tenancy.owner_a, minutes_ahead=1181).json()
+    assert created["room_id"] == str(calendar_tenancy.room_a.id)
+
+    response = client.patch(
+        f"{APPOINTMENTS_URL}/{created['id']}",
+        json={"expected_version": created["version"], "room_id": None},
+        headers=dev_headers(tenancy.owner_a, tenancy.tenant_a.id),
+    )
+    assert response.status_code == 200
+    assert response.json()["room_id"] is None
+
+
+def test_metadata_update_omitted_room_id_unchanged(client, calendar_tenancy):
+    tenancy = calendar_tenancy.tenancy
+    created = _create(client, calendar_tenancy, tenancy.owner_a, minutes_ahead=1182).json()
+    response = client.patch(
+        f"{APPOINTMENTS_URL}/{created['id']}",
+        json={"expected_version": created["version"], "notes": "unrelated change"},
+        headers=dev_headers(tenancy.owner_a, tenancy.tenant_a.id),
+    )
+    assert response.status_code == 200
+    assert response.json()["room_id"] == created["room_id"]
+
+
+def test_metadata_update_rejects_inactive_room(client, calendar_tenancy):
+    tenancy = calendar_tenancy.tenancy
+    created = _create(
+        client, calendar_tenancy, tenancy.owner_a, minutes_ahead=1183, room_id=None
+    ).json()
+    client.post(
+        f"/api/v1/rooms/{calendar_tenancy.room_a.id}/deactivate",
+        headers=dev_headers(tenancy.owner_a, tenancy.tenant_a.id),
+    )
+
+    response = client.patch(
+        f"{APPOINTMENTS_URL}/{created['id']}",
+        json={"expected_version": created["version"], "room_id": str(calendar_tenancy.room_a.id)},
+        headers=dev_headers(tenancy.owner_a, tenancy.tenant_a.id),
+    )
+    assert response.status_code == 409
+    assert response.json()["code"] == "room_unavailable"
+
+
+def test_metadata_update_rejects_cross_tenant_room(client, calendar_tenancy):
+    tenancy = calendar_tenancy.tenancy
+    created = _create(
+        client, calendar_tenancy, tenancy.owner_a, minutes_ahead=1184, room_id=None
+    ).json()
+    other_tenant_room = client.post(
+        "/api/v1/rooms",
+        json={"name": "Other tenant room", "code": "OTR", "description": None},
+        headers=dev_headers(tenancy.owner_b, tenancy.tenant_b.id),
+    ).json()
+
+    response = client.patch(
+        f"{APPOINTMENTS_URL}/{created['id']}",
+        json={"expected_version": created["version"], "room_id": other_tenant_room["id"]},
+        headers=dev_headers(tenancy.owner_a, tenancy.tenant_a.id),
+    )
+    assert response.status_code == 404
+
+
+def test_metadata_update_room_change_respects_occupied_room(client, calendar_tenancy, db_session):
+    # Same room, same time, a DIFFERENT provider's blocking appointment ->
+    # changing this appointment onto that room/time should be rejected.
+    # A small, fixed minutes_ahead (matching the established pattern used
+    # throughout this file) keeps the appointment safely on the SAME
+    # local calendar day the schedule row below is created for - a large
+    # offset risks landing on a different weekday (if it crosses
+    # midnight) or even a different LOCAL day than `date.today()`
+    # computes in UTC, whereas the appointment's own day is computed
+    # from its tenant-local instant, not the test process's UTC date.
+    from datetime import date, time
+    from zoneinfo import ZoneInfo
+
+    from app.models.provider_schedule import ProviderSchedule, ProviderScheduleStatus
+
+    tenancy = calendar_tenancy.tenancy
+    starts_at, ends_at = _near_future_window(minutes_ahead=150)
+    local_date = starts_at.astimezone(ZoneInfo("Europe/Sofia")).date()
+    db_session.add(
+        ProviderSchedule(
+            tenant_id=tenancy.tenant_a.id,
+            provider_user_id=tenancy.manager_a,
+            day_of_week=local_date.weekday(),
+            start_time=time(0, 0),
+            end_time=time(23, 59),
+            effective_from=date(2020, 1, 1),
+            effective_until=None,
+            room_id=calendar_tenancy.room_a.id,
+            status=ProviderScheduleStatus.ACTIVE,
+        )
+    )
+    db_session.flush()
+
+    occupying = client.post(
+        APPOINTMENTS_URL,
+        json={
+            "provider_user_id": str(tenancy.manager_a),
+            "room_id": str(calendar_tenancy.room_a.id),
+            "service_type_id": str(calendar_tenancy.service_type_a.id),
+            "starts_at": starts_at.isoformat(),
+            "ends_at": ends_at.isoformat(),
+            "patient_display_name": "Occupying patient",
+        },
+        headers=dev_headers(tenancy.manager_a, tenancy.tenant_a.id),
+    )
+    assert occupying.status_code == 200
+
+    # owner_a's own appointment, same time window, currently no room.
+    created = client.post(
+        APPOINTMENTS_URL,
+        json={
+            "provider_user_id": str(tenancy.owner_a),
+            "room_id": None,
+            "service_type_id": str(calendar_tenancy.service_type_a.id),
+            "starts_at": starts_at.isoformat(),
+            "ends_at": ends_at.isoformat(),
+            "patient_display_name": "Movable patient",
+        },
+        headers=dev_headers(tenancy.owner_a, tenancy.tenant_a.id),
+    ).json()
+
+    response = client.patch(
+        f"{APPOINTMENTS_URL}/{created['id']}",
+        json={"expected_version": created["version"], "room_id": str(calendar_tenancy.room_a.id)},
+        headers=dev_headers(tenancy.owner_a, tenancy.tenant_a.id),
+    )
+    assert response.status_code == 409
+    assert response.json()["code"] == "appointment_conflict"
+
+
+def test_metadata_update_response_redaction_is_keyed_by_caller_not_provider(
+    client, calendar_tenancy, db_session
+):
+    # auditor_a has no ProviderSchedule of its own, so reassigning it as
+    # provider would make an availability-checked field (like room_id)
+    # unrelated-ly fail with "outside_schedule" - use `notes` (no
+    # availability check) to isolate exactly what this test is about:
+    # _serialize's redaction decision depends on the CALLER's role, not
+    # the appointment's provider. An owner (contact-visible) updating an
+    # auditor-provider's appointment still gets the full response.
+    from app.models.appointment import Appointment
+
+    tenancy = calendar_tenancy.tenancy
+    created = _create(client, calendar_tenancy, tenancy.owner_a, minutes_ahead=1186).json()
+    row = db_session.get(Appointment, uuid.UUID(created["id"]))
+    row.provider_user_id = tenancy.auditor_a
+    db_session.flush()
+
+    response = client.patch(
+        f"{APPOINTMENTS_URL}/{created['id']}",
+        json={"expected_version": created["version"], "notes": "Owner-authored note"},
+        headers=dev_headers(tenancy.owner_a, tenancy.tenant_a.id),
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["patient_phone"] == "+359881234567"
+    assert body["notes"] == "Owner-authored note"

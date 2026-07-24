@@ -262,13 +262,18 @@ export type Appointment = {
   created_at: string;
   updated_at: string;
   cancelled_at: string | null;
-  // Present only for CALENDAR_CONTACT_VISIBLE_ROLES or the appointment's
-  // own provider - absent (not merely null) for e.g. an auditor viewing
-  // someone else's appointment (see app.api.appointments._serialize).
-  patient_display_name?: string;
+  // patient_display_name and notes are always present - redaction is
+  // field-level, not row-level, so the appointment stays identifiable
+  // in a calendar view even for a role without contact visibility.
+  // patient_phone/patient_email are present only for
+  // CALENDAR_CONTACT_VISIBLE_ROLES - absent (not merely null) for e.g.
+  // an auditor viewing any appointment, including their own as provider
+  // (see app.api.appointments._serialize - there is no self-provider
+  // bypass for contact visibility).
+  patient_display_name: string;
+  notes: string | null;
   patient_phone?: string | null;
   patient_email?: string | null;
-  notes?: string | null;
   cancellation_reason?: string | null;
   created_by_user_id?: string;
   updated_by_user_id?: string | null;
@@ -320,6 +325,7 @@ export function updateAppointmentMetadata(
     patient_phone?: string | null;
     patient_email?: string | null;
     notes?: string | null;
+    room_id?: string | null;
   },
 ) {
   return apiFetch<Appointment>(`/api/v1/appointments/${id}`, {

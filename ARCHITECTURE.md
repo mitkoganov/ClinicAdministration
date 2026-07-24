@@ -551,12 +551,13 @@ potentially slow availability recheck.
   regardless of role — "provider" is a fact, not a permission grant.
   `cancel`/`confirm`/`reschedule` have no such bypass and always require a
   `CALENDAR_WRITE_ROLES` role, even for the appointment's own provider.
-  `update_metadata` (patient contact snapshot, notes) likewise has **no**
-  self-scoped bypass — being the appointment's own provider does not, by
-  itself, grant the right to edit its patient contact/notes fields; every
-  caller, including the provider, needs `CALENDAR_WRITE_ROLES` (fixed in
-  the MED-005 repair round; an earlier version incorrectly extended the
-  complete/no-show bypass to metadata updates too).
+  `update_metadata` (patient contact snapshot, notes, room) likewise has
+  **no** self-scoped bypass — being the appointment's own provider does
+  not, by itself, grant the right to edit its patient contact/notes/room
+  fields; every caller, including the provider, needs
+  `CALENDAR_WRITE_ROLES` (fixed in the MED-005 repair round; an earlier
+  version incorrectly extended the complete/no-show bypass to metadata
+  updates too).
 * **Role matrix** (`backend/app/core/authorization.py`): `CALENDAR_READ_ROLES`
   = owner/manager/operator/auditor; `CALENDAR_WRITE_ROLES` =
   owner/manager/operator; `CALENDAR_CONFIG_ROLES` (rooms, service types,
@@ -564,10 +565,21 @@ potentially slow availability recheck.
   (booking outside the computed availability, with a required
   `override_reason`) = owner/manager; `CALENDAR_CONTACT_VISIBLE_ROLES`
   (patient phone/email snapshot) = owner/manager/operator — `AUDITOR` may
-  read the calendar but never the patient contact snapshot
+  read the calendar and always sees `patient_display_name` (redaction is
+  field-level, not row-level, so the appointment stays identifiable in a
+  calendar view) but never the patient phone/email snapshot
   (`app.api.appointments._serialize` returns a redacted
   `AppointmentSummaryRead` instead of `AppointmentRead`), and
   `CONTENT_EDITOR` has no calendar permission at all in this slice.
+  `_serialize` is keyed **only** on the caller's role — never on whether
+  the caller happens to be the appointment's own provider — and is the
+  single place every appointment response (read, list, create, metadata
+  update, reschedule, every lifecycle action) is built; no route calls
+  `AppointmentRead.model_validate(...)` directly (fixed in a second
+  MED-005 repair round: an earlier version had a self-provider bypass in
+  `_serialize` that granted full contact visibility regardless of role,
+  and several lifecycle-action routes bypassed `_serialize` entirely by
+  calling `AppointmentRead.model_validate(...)` directly).
 * **Availability self-scope**: `GET /api/v1/availability` is not gated by
   `CALENDAR_READ_ROLES` alone — per task.md's authorization matrix ("View
   own calendar (self as provider) | any active member (self-scoped
@@ -624,6 +636,18 @@ behind `Depends(require_csrf)`, business-logic-in-routes forbidden (routes
 call a service method and serialize its return value only), and
 transaction ownership stays in the service layer throughout (repositories
 `flush()`, never `commit()`).
+
+`PATCH /api/v1/appointments/{id}` (`AppointmentMetadataUpdate`) distinguishes
+an **omitted** field (left unchanged) from an **explicit `null`** (cleared)
+via Pydantic's `model_fields_set` — never a plain `if value is not None`
+filter, which cannot tell the two apart and would make an already-set
+`patient_phone`/`patient_email`/`notes`/`room_id` impossible to clear
+(fixed in a second MED-005 repair round). `room_id` is an accepted
+metadata field (task.md scopes this PATCH to "patient contact snapshot,
+notes, room") and goes through the same tenant/active-room/availability
+validation as create/reschedule — never a bare column write; `patient_display_name`
+cannot be cleared (schema-level `422`) since it is not nullable on the
+model.
 
 ### Frontend
 
