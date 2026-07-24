@@ -129,11 +129,17 @@ function readCookie(name: string): string | null {
 export class ApiError extends Error {
   status: number;
   detail: string;
+  /** The optional machine-readable error code some endpoints add
+   * alongside `detail` (see app.core.errors.AppError's `code` field,
+   * e.g. "appointment_conflict"/"outside_schedule"/"stale_version" from
+   * MED-005) - `undefined` for every error response that doesn't set one. */
+  code?: string;
 
-  constructor(status: number, detail: string) {
+  constructor(status: number, detail: string, code?: string) {
     super(`API request failed (${status}): ${detail}`);
     this.status = status;
     this.detail = detail;
+    this.code = code;
   }
 }
 
@@ -171,7 +177,11 @@ export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> 
       body && typeof body === "object" && "detail" in body
         ? String((body as { detail: unknown }).detail)
         : `backend responded with ${response.status}`;
-    throw new ApiError(response.status, detail);
+    const code =
+      body && typeof body === "object" && "code" in body
+        ? String((body as { code: unknown }).code)
+        : undefined;
+    throw new ApiError(response.status, detail, code);
   }
 
   return body as T;
