@@ -8,6 +8,7 @@ from sqlalchemy.orm import Mapped, mapped_column, validates
 from sqlalchemy.types import Uuid
 
 from app.core.slug import normalize_and_validate_slug
+from app.core.timezone import DEFAULT_TENANT_TIMEZONE, validate_timezone_name
 from app.db.base import Base
 
 # Mirrors app.core.slug.validate_slug's rules at the database level: a
@@ -51,6 +52,15 @@ class Tenant(Base):
         nullable=False,
         default=TenantStatus.ACTIVE,
     )
+    # MED-005: the IANA timezone recurring provider schedules are expressed
+    # in local wall-clock time against (see app.core.timezone). The
+    # server_default only seeds pre-MED-005 tenant rows and brand-new
+    # tenants that don't explicitly choose one - never read as a hardcoded
+    # assumption anywhere in availability/scheduling logic; every
+    # calculation must read this column from the actual tenant.
+    timezone: Mapped[str] = mapped_column(
+        String(64), nullable=False, server_default=DEFAULT_TENANT_TIMEZONE
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -73,3 +83,12 @@ class Tenant(Base):
         # app.core.slug.InvalidSlugError - a ValueError subclass - if the
         # normalized result is still invalid (e.g. punctuation-only input).
         return normalize_and_validate_slug(value)
+
+    @validates("timezone")
+    def _validate_timezone(self, key: str, value: str) -> str:
+        # ORM-layer validation only - a CHECK constraint cannot validate
+        # against the full IANA timezone database, so there is no
+        # equivalent database-level enforcement layer here (unlike slug's
+        # two-layer design above). Document that limitation rather than
+        # overclaiming DB-level enforcement.
+        return validate_timezone_name(value)
