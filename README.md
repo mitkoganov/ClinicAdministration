@@ -76,8 +76,11 @@ The backend now has a tenant/membership domain and tenant-scoped demo API
 (`/api/v1/tenant-context`, `/api/v1/tenant-resources`), plus clinic and staff
 administration (`/api/v1/clinic`, `/api/v1/clinic/staff`) — see
 [ARCHITECTURE.md](ARCHITECTURE.md) → "Multi-tenancy" and "Clinic and staff
-administration". No real authentication exists yet, so local testing uses a
-**development-only** identity header provider that is disabled by default.
+administration". Real login/session authentication now exists too (see
+"Authentication (local testing)" below); the **development-only** identity
+header provider described here remains available as a lower-friction way to
+exercise tenant-scoped routes without creating an account, and is disabled
+by default.
 
 1. Enable it only in a `development` environment (`.env`):
    ```env
@@ -109,6 +112,58 @@ administration". No real authentication exists yet, so local testing uses a
    step 2 into the "Development identity" banner shown at the top — it is
    stored in the browser's `localStorage` only, never a security boundary,
    and is attached as headers to every API call the page makes.
+
+## Authentication (local testing)
+
+The backend now has production login/session authentication
+(`/api/v1/auth/*`) — see [ARCHITECTURE.md](ARCHITECTURE.md) → "Authentication
+and user identity" and [SECURITY.md](SECURITY.md) → "Authentication threat
+model". This is independent of the development identity headers described
+above; a real session always takes priority over a dev header when both are
+present.
+
+1. Run migrations (adds `user_accounts`, `auth_sessions`, `one_time_tokens`
+   on top of the existing tenant/membership tables):
+   ```powershell
+   cd backend
+   .venv\Scripts\python -m alembic upgrade head
+   ```
+2. This foundation stage has no account-provisioning UI or self-signup
+   endpoint. Create a `UserAccount` directly (e.g. via a short Python
+   script using `app.core.passwords.hash_password` and the app's models,
+   the same way you'd insert a `Tenant`/`TenantMembership` row today) before
+   testing login.
+3. Start the backend and frontend, then open `/login` and sign in with that
+   account's email/password. A successful login sets the session and CSRF
+   cookies; `/settings/*` pages then use the session automatically
+   (`frontend/app/lib/api.ts`) — no dev-identity headers are required once
+   logged in.
+4. Login is throttled per (email, client IP) via Redis
+   (`LOGIN_RATE_LIMIT_MAX_ATTEMPTS`/`LOGIN_RATE_LIMIT_WINDOW_SECONDS` in
+   `.env.example`) — make sure `docker compose up -d redis` is running, or
+   rate limiting fails open (allows the request) rather than blocking login
+   entirely; see `SECURITY.md`.
+5. Password reset (`/forgot-password`, `/reset-password`) and invitation
+   acceptance (`/invitations/accept`) issue and validate tokens
+   server-side, but **no email is sent** — there is no delivery mechanism
+   in this foundation stage. The `one_time_tokens` table only ever stores
+   a SHA-256 **hash** of the token (see `SECURITY.md` — a raw token is
+   never persisted, so it cannot be recovered from the database, and it
+   must never be logged either). The only place the raw token exists is
+   the return value of `PasswordResetService.request_reset` /
+   `InvitationService.create_invitation` at the moment of creation — the
+   production API routes deliberately discard it. To exercise either
+   flow locally:
+   - preferred: see the automated coverage in
+     `backend/tests/integration/test_password_reset_service.py` and
+     `test_invitation_service.py`, which call these methods directly and
+     use the returned raw token exactly as a real client would;
+   - for manual exploration, call the same service method from a local
+     Python shell (`.venv\Scripts\python`) against your dev database,
+     capture the returned string in that shell session only, and build
+     the URL by hand, e.g.
+     `http://localhost:3000/reset-password?token=<raw token>` — never
+     print/log it, and never commit anything that does.
 
 ## Running tests
 

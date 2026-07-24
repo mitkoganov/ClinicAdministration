@@ -1,13 +1,19 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { clearDevIdentity, readDevIdentity, writeDevIdentity } from "./lib";
+import {
+  clearDevIdentity,
+  isDevelopmentIdentityAvailable,
+  readDevIdentity,
+  writeDevIdentity,
+} from "../lib/api";
 
 /** Development-only identity picker: the backend's real identity provider
  * is disabled by default and only ever enabled in a `development`
- * environment (see app/core/identity.py). Until authentication exists,
- * this is how a developer tells the frontend which user/clinic to act as -
- * it is never a security boundary, only a convenience for local testing. */
+ * environment (see app/core/identity.py). Since MED-004, the normal path
+ * is a real login session (see /login) - this banner is a convenience for
+ * local testing only, is never a security boundary, and is never rendered
+ * in a production build at all. */
 export function IdentityBanner() {
   const [userIdInput, setUserIdInput] = useState("");
   const [tenantIdInput, setTenantIdInput] = useState("");
@@ -28,6 +34,10 @@ export function IdentityBanner() {
       }
     });
   }, []);
+
+  if (!isDevelopmentIdentityAvailable()) {
+    return null;
+  }
 
   function handleSave() {
     if (!userIdInput.trim() || !tenantIdInput.trim()) {
@@ -57,9 +67,10 @@ export function IdentityBanner() {
       }}
     >
       <p style={{ marginBottom: "0.5rem" }}>
-        <strong>Development identity</strong> — no authentication exists yet. Enter a user id and
-        tenant (clinic) id with an active membership to act as that user. This is never a
-        security boundary; the server independently re-validates both.
+        <strong>Development identity</strong> — optional, local-testing only. Prefer logging in
+        normally at <a href="/login">/login</a>. If set, these headers are attached to every
+        request, but a real session always takes priority server-side and is never overridden by
+        this.
       </p>
       <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap", alignItems: "center" }}>
         <input

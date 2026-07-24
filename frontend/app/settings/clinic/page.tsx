@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { apiFetch, errorMessage, readDevIdentity } from "../lib";
+import { apiFetch, errorMessage } from "../../lib/api";
 
 type Clinic = {
   id: string;
@@ -12,7 +12,6 @@ type Clinic = {
 };
 
 type ClinicState =
-  | { kind: "no-identity" }
   | { kind: "loading" }
   | { kind: "error"; message: string }
   | { kind: "loaded"; clinic: Clinic };
@@ -27,13 +26,7 @@ export default function ClinicSettingsPage() {
   const [submitSuccess, setSubmitSuccess] = useState(false);
 
   const load = useCallback(() => {
-    const identity = readDevIdentity();
-    if (!identity) {
-      setState({ kind: "no-identity" });
-      return;
-    }
-    setState({ kind: "loading" });
-    apiFetch<Clinic>(identity, "/api/v1/clinic")
+    apiFetch<Clinic>("/api/v1/clinic")
       .then((clinic) => {
         setState({ kind: "loaded", clinic });
         setNameInput(clinic.name);
@@ -54,8 +47,7 @@ export default function ClinicSettingsPage() {
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    const identity = readDevIdentity();
-    if (!identity || state.kind !== "loaded") {
+    if (state.kind !== "loaded") {
       return;
     }
     if (!nameInput.trim()) {
@@ -67,7 +59,7 @@ export default function ClinicSettingsPage() {
     setSubmitError(null);
     setSubmitSuccess(false);
     try {
-      const updated = await apiFetch<Clinic>(identity, "/api/v1/clinic", {
+      const updated = await apiFetch<Clinic>("/api/v1/clinic", {
         method: "PATCH",
         body: JSON.stringify({ name: nameInput.trim() }),
       });
@@ -80,9 +72,6 @@ export default function ClinicSettingsPage() {
     }
   }
 
-  if (state.kind === "no-identity") {
-    return <p>Set a development identity above to view clinic settings.</p>;
-  }
   if (state.kind === "loading") {
     return <p>Loading clinic settings…</p>;
   }

@@ -11,10 +11,20 @@ def app(app):
     """Overrides the base `app` fixture (same name, closer conftest wins)
     to enable the development identity provider for every integration test
     in this directory, without affecting unit tests or the pre-existing
-    health/config/ready test suites."""
+    health/config/ready test suites.
+
+    `session_cookie_secure=False` is required here too (MED-004): the real
+    default is `True` (correctly, for anything resembling production), but
+    a `Secure` cookie is never resent by an HTTP client over the plain-HTTP
+    `http://testserver` transport `TestClient` uses - without this override
+    every request after login would silently appear unauthenticated."""
 
     def _override_get_settings() -> Settings:
-        return Settings(environment="development", development_identity_enabled=True)
+        return Settings(
+            environment="development",
+            development_identity_enabled=True,
+            session_cookie_secure=False,
+        )
 
     app.dependency_overrides[get_settings] = _override_get_settings
     return app

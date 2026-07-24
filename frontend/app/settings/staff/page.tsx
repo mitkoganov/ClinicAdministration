@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { apiFetch, errorMessage, readDevIdentity } from "../lib";
+import { apiFetch, errorMessage } from "../../lib/api";
 
 type MembershipRole = "owner" | "manager" | "operator" | "content_editor" | "auditor";
 type MembershipStatus = "active" | "inactive";
@@ -22,7 +22,6 @@ type StaffList = {
 };
 
 type ListState =
-  | { kind: "no-identity" }
   | { kind: "loading" }
   | { kind: "error"; message: string }
   | { kind: "loaded"; list: StaffList; viewerRole: MembershipRole };
@@ -80,12 +79,6 @@ export default function StaffPage() {
   const [pendingRowId, setPendingRowId] = useState<string | null>(null);
 
   const load = useCallback(() => {
-    const identity = readDevIdentity();
-    if (!identity) {
-      setState({ kind: "no-identity" });
-      return;
-    }
-    setState({ kind: "loading" });
     const params = new URLSearchParams();
     params.set("limit", String(PAGE_SIZE));
     params.set("offset", String(offset));
@@ -93,8 +86,8 @@ export default function StaffPage() {
     if (statusFilter) params.set("status", statusFilter);
 
     Promise.all([
-      apiFetch<StaffList>(identity, `/api/v1/clinic/staff?${params.toString()}`),
-      apiFetch<ClinicContext>(identity, "/api/v1/clinic"),
+      apiFetch<StaffList>(`/api/v1/clinic/staff?${params.toString()}`),
+      apiFetch<ClinicContext>("/api/v1/clinic"),
     ])
       .then(([list, clinic]) => setState({ kind: "loaded", list, viewerRole: clinic.role }))
       .catch((error: unknown) => setState({ kind: "error", message: errorMessage(error) }));
@@ -111,14 +104,13 @@ export default function StaffPage() {
 
   async function handleAddMember(e: React.FormEvent) {
     e.preventDefault();
-    const identity = readDevIdentity();
-    if (!identity || !newUserId.trim()) {
+    if (!newUserId.trim()) {
       return;
     }
     setAddSubmitting(true);
     setAddError(null);
     try {
-      await apiFetch(identity, "/api/v1/clinic/staff", {
+      await apiFetch("/api/v1/clinic/staff", {
         method: "POST",
         body: JSON.stringify({ user_id: newUserId.trim(), role: newRole }),
       });
@@ -152,12 +144,10 @@ export default function StaffPage() {
     if (!window.confirm(`Remove ${member.user_id} from this clinic's staff?`)) {
       return;
     }
-    const identity = readDevIdentity();
-    if (!identity) return;
     setPendingRowId(member.id);
     setRowError(null);
     try {
-      await apiFetch(identity, `/api/v1/clinic/staff/${member.id}`, { method: "DELETE" });
+      await apiFetch(`/api/v1/clinic/staff/${member.id}`, { method: "DELETE" });
       load();
     } catch (error: unknown) {
       setRowError(errorMessage(error));
@@ -170,12 +160,10 @@ export default function StaffPage() {
     membershipId: string,
     payload: { role?: MembershipRole; status?: MembershipStatus },
   ) {
-    const identity = readDevIdentity();
-    if (!identity) return;
     setPendingRowId(membershipId);
     setRowError(null);
     try {
-      await apiFetch(identity, `/api/v1/clinic/staff/${membershipId}`, {
+      await apiFetch(`/api/v1/clinic/staff/${membershipId}`, {
         method: "PATCH",
         body: JSON.stringify(payload),
       });
@@ -187,9 +175,6 @@ export default function StaffPage() {
     }
   }
 
-  if (state.kind === "no-identity") {
-    return <p>Set a development identity above to view staff.</p>;
-  }
   if (state.kind === "loading") {
     return <p>Loading staff…</p>;
   }

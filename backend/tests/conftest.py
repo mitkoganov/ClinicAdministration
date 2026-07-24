@@ -9,7 +9,7 @@ from app.db.session import get_db
 from app.main import create_app
 from tests.db_safety import get_test_database_url
 
-pytest_plugins = ["tests.factories"]
+pytest_plugins = ["tests.factories", "tests.auth_factories"]
 
 
 @pytest.fixture(scope="session")
